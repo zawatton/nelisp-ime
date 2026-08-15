@@ -45,3 +45,6 @@ target/
 # OSS-bound repo (= ad-hoc local file is fine, but never tracked).
 /CLAUDE.md
 dist/
+platform/common/build-cmake/
+platform/windows/tsf/build/
+.nelisp-host-helper.log.*
