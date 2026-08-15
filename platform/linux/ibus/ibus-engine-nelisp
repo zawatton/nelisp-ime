@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Thin IBus adapter for the portable NeLisp Japanese IME engine."""
+
+import uuid
+
+from nelisp_client import NeLispClient
+
+import gi
+gi.require_version("IBus", "1.0")
+from gi.repository import GLib, IBus  # noqa: E402
+
+
+class NeLispEngine(IBus.Engine):
+    __gtype_name__ = "NeLispIBusEngine"
+    client = None
+
+    def __init__(self, connection, object_path):
+        super().__init__(connection=connection, object_path=object_path)
+        if NeLispEngine.client is None:
+            NeLispEngine.client = NeLispClient()
+        self.session_id = "ibus:" + str(uuid.uuid4())
+        self.client.request("ime/session.open",
+                            {"sessionId": self.session_id, "inputStyle": "romaji"})
+        self.snapshot = {"preedit": "", "candidates": [], "candidate-index": 0}
+        self.lookup = IBus.LookupTable.new(9, 0, True, True)
+
+    def _feed(self, event):
+        self.snapshot = self.client.request(
+            "ime/session.feed", {"sessionId": self.session_id, "event": event})
+        commit = self.snapshot.get("commit")
+        if commit:
+            self.commit_text(IBus.Text.new_from_string(commit))
+            self.client.save_learning()
+        preedit = self.snapshot.get("preedit", "")
+        self.update_preedit_text(IBus.Text.new_from_string(preedit), len(preedit), bool(preedit))
+        self.lookup.clear()
+        for candidate in self.snapshot.get("candidates") or []:
+            self.lookup.append_candidate(IBus.Text.new_from_string(candidate))
+        self.lookup.set_cursor_pos(self.snapshot.get("candidate-index", 0))
+        self.update_lookup_table(self.lookup, self.lookup.get_number_of_candidates() > 1)
+        return True
+
+    def do_process_key_event(self, keyval, keycode, state):
+        del keycode
+        if state & IBus.ModifierType.RELEASE_MASK:
+            return False
+        if state & (IBus.ModifierType.CONTROL_MASK | IBus.ModifierType.MOD1_MASK |
+                    IBus.ModifierType.SUPER_MASK):
+            return False
+        composing = bool(self.snapshot.get("preedit"))
+        if keyval == IBus.KEY_BackSpace and composing:
+            return self._feed({"op": "backspace"})
+        if keyval == IBus.KEY_Escape and composing:
+            return self._feed({"op": "cancel"})
+        if keyval in (IBus.KEY_Return, IBus.KEY_KP_Enter) and composing:
+            return self._feed({"op": "commit"})
+        candidates = self.snapshot.get("candidates") or []
+        if keyval == IBus.KEY_space and candidates:
+            index = (self.snapshot.get("candidate-index", 0) + 1) % len(candidates)
+            return self._feed({"op": "select-candidate", "index": index})
+        segments = self.snapshot.get("segments") or []
+        active = self.snapshot.get("active-segment", 0)
+        if keyval == IBus.KEY_Left and active > 0:
+            return self._feed({"op": "select-segment", "index": active - 1})
+        if keyval == IBus.KEY_Right and active + 1 < len(segments):
+            return self._feed({"op": "select-segment", "index": active + 1})
+        codepoint = IBus.keyval_to_unicode(keyval)
+        key = chr(codepoint) if codepoint else ""
+        if key.isascii() and (key.isalpha() or key == "'"):
+            return self._feed({"op": "key", "key": key.lower()})
+        if composing and key and key.isprintable():
+            self._feed({"op": "commit"})
+            self.commit_text(IBus.Text.new_from_string(key))
+            return True
+        return composing
+
+    def do_candidate_clicked(self, index, button, state):
+        del button, state
+        self._feed({"op": "select-candidate", "index": index})
+        self._feed({"op": "commit"})
+
+    def do_reset(self):
+        self._feed({"op": "cancel"})
+
+    def do_destroy(self):
+        try:
+            self.client.request("ime/session.close", {"sessionId": self.session_id})
+        finally:
+            super().do_destroy()
+
+
+def main():
+    IBus.init()
+    bus = IBus.Bus.new()
+    factory = IBus.Factory.new(bus.get_connection())
+    factory.add_engine("nelisp-ime", NeLispEngine.__gtype__)
+    bus.request_name("org.freedesktop.IBus.NeLispIME", 0)
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    finally:
+        if NeLispEngine.client:
+            NeLispEngine.client.close()
+
+
+if __name__ == "__main__":
+    main()

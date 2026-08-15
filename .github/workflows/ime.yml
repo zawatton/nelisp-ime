@@ -1,0 +1,82 @@
+name: Portable NeLisp IME
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'packages/nelisp-ime/**'
+      - 'packages/nelisp-json/**'
+      - 'platform/**'
+      - '.github/workflows/ime.yml'
+  pull_request:
+    paths:
+      - 'packages/nelisp-ime/**'
+      - 'packages/nelisp-json/**'
+      - 'platform/**'
+      - '.github/workflows/ime.yml'
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@v8.0
+        with:
+          version: '30.1'
+      - run: make test-one FILE="packages/nelisp-ime/test/nelisp-ime-test.el packages/nelisp-ime/test/nelisp-ime-protocol-test.el"
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@v8.0
+        with:
+          version: '30.1'
+      - name: Install adapter SDKs
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake libfcitx5core-dev libibus-1.0-dev libxml2-utils
+      - name: Build Fcitx 5 addon
+        run: |
+          make standalone-reader
+          cmake -S platform/linux -B platform/linux/build -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build platform/linux/build --parallel 2
+          DESTDIR="$RUNNER_TEMP/nelisp-ime-stage" cmake --install platform/linux/build
+      - name: Check IBus bridge
+        run: make -C platform/linux/ibus check
+      - name: Build Linux NeLisp and run protocol integration
+        run: make -C platform/common smoke
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@v8.0
+        with:
+          version: '30.1'
+      - run: make standalone-reader
+      - run: make -C platform/macos smoke
+      - run: make -C platform/common smoke
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jcs090218/setup-emacs-windows@master
+        with:
+          version: '30.1'
+      - name: Build Windows NeLisp
+        shell: bash
+        run: make standalone-reader
+      - name: Build TSF DLL and common smoke
+        shell: pwsh
+        run: |
+          cmake -S platform/windows/tsf -B platform/windows/tsf/build -A x64
+          cmake --build platform/windows/tsf/build --config Release
+          platform/windows/tsf/build/Release/nelisp-ime-tsf-smoke.exe platform/windows/tsf/build/Release/nelisp-ime-tsf.dll
+          & "$env:SystemRoot\System32\regsvr32.exe" /s platform/windows/tsf/build/Release/nelisp-ime-tsf.dll
+          if ($LASTEXITCODE -ne 0) { throw "TSF registration failed" }
+          & "$env:SystemRoot\System32\regsvr32.exe" /s /u platform/windows/tsf/build/Release/nelisp-ime-tsf.dll
+          cmake -S platform/common -B platform/common/build-cmake -A x64
+          cmake --build platform/common/build-cmake --config Release
+          platform/common/build-cmake/Release/nelisp-ime-common-smoke.exe target/nelisp.exe $PWD platform/common/build-cmake/learning.json
+          & platform/windows/tsf/install.ps1 -BuildDirectory platform/windows/tsf/build -Destination "$env:RUNNER_TEMP\NeLispIME" -NoRegister
+          if (-not (Test-Path "$env:RUNNER_TEMP\NeLispIME\bin\nelisp-ime-tsf.dll")) { throw "TSF staging failed" }

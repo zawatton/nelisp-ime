@@ -1,0 +1,18 @@
+#+TITLE: NeLisp IME for macOS
+
+This InputMethodKit adapter maps each input controller to one portable NeLisp
+IME session and shares a persistent NeLisp process across sessions.  The app
+contains the runtime, portable engine, and generated SKK dictionary; it does not
+delegate conversion to the macOS system Japanese IME.  Space opens the native
+candidate panel.  Candidate choices are persisted as JSON under
+=~/Library/Application Support/NeLispIME/learning.json=.
+
+#+begin_src sh
+make -C platform/macos
+make -C platform/macos smoke
+make -C platform/macos install
+#+end_src
+
+Log out and back in after first installation, then enable “NeLisp Japanese” in
+Keyboard > Input Sources.  Development builds may set =NELISP_IME_RUNTIME= and
+=NELISP_IME_ROOT= to override packaged resources.

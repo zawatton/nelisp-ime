@@ -1,0 +1,7 @@
+[Addon]
+Name=NeLisp Japanese IME
+Category=InputMethod
+Version=@PROJECT_VERSION@
+Library=nelisp-ime
+Type=SharedLibrary
+OnDemand=True

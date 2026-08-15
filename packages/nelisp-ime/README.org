@@ -1,0 +1,77 @@
+#+TITLE: Portable NeLisp Japanese IME
+
+* Overview
+
+=nelisp-ime= is a Japanese conversion engine implemented in Elisp and runnable
+by standalone NeLisp.  The same engine is intended to sit behind macOS
+InputMethodKit, Linux Fcitx 5/IBus, and Windows TSF adapters.  Native code owns
+only OS integration, event translation, and candidate-window presentation.
+
+The current engine provides:
+
+- independent composition sessions and live conversion after every key;
+- JIS kana and incremental romaji normalization;
+- dictionary lattice construction and minimum-cost path selection;
+- segment and candidate selection;
+- frequency learning with validated import/export;
+- a versioned line-oriented JSON-RPC boundary;
+- an indexed UTF-8 dictionary using the official SKK medium vocabulary,
+  large-dictionary candidate ranking, grammatical kana priority, and
+  conservative okurigana conjugation expansion.
+
+* Public API
+
+- =nelisp-ime-session-open= / =nelisp-ime-session-close=
+- =nelisp-ime-feed=
+- =nelisp-ime-lattice-convert=
+- =nelisp-ime-dictionary-install= / =nelisp-ime-dictionary-load-skk=
+- =nelisp-ime-learning-import= / =nelisp-ime-learning-export=
+- =nelisp-ime-protocol-handle-json=
+
+#+begin_src emacs-lisp
+(nelisp-ime-session-open "macos:42" '(:input-style kana))
+(nelisp-ime-feed "macos:42" '(:op :insert :text "かんじ"))
+;; => ... :preedit "漢字" ...
+(nelisp-ime-feed "macos:42" '(:op :commit))
+#+end_src
+
+Events support =:key=, =:insert=, =:backspace=, =:select-segment=,
+=:select-candidate=, =:commit=, and =:cancel=.  Snapshots contain only portable
+Lisp/JSON values.
+
+* Architecture
+
+#+begin_example
+InputMethodKit / Fcitx 5 or IBus / TSF
+                 |
+          JSON-RPC protocol v1
+                 |
+      persistent standalone NeLisp
+                 |
+ key normalization -> lattice conversion -> learning
+#+end_example
+
+The generated dictionary file is used by standalone NeLisp because raw SKK
+files require encoding and editor-buffer facilities.  See =data/README.md= for
+regeneration and larger-dictionary substitution.
+
+* Validation
+
+#+begin_src sh
+make test-one FILE="packages/nelisp-ime/test/nelisp-ime-test.el packages/nelisp-ime/test/nelisp-ime-protocol-test.el"
+make -C platform/macos smoke
+make -C platform/common smoke
+make -C platform/linux/ibus smoke
+#+end_src
+
+The repository also contains a dedicated four-job GitHub Actions workflow for
+the core, macOS InputMethodKit, Linux Fcitx 5/IBus, and Windows TSF builds.
+
+* References
+
+- GNU Emacs =quail= and =kkc.el=
+- DDSKK: https://github.com/skk-dev/ddskk
+- Official SKK dictionaries: https://github.com/skk-dev/dict
+- Apple InputMethodKit =IMKInputController=
+- Microsoft Text Services Framework
+- Fcitx 5 input-method engine API and IBus

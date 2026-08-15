@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component>
+  <name>org.freedesktop.IBus.NeLispIME</name>
+  <description>NeLisp Japanese IME</description>
+  <exec>/usr/libexec/ibus-engine-nelisp</exec>
+  <version>0.1.0</version>
+  <license>GPL-3.0-or-later</license>
+  <author>NeLisp contributors</author>
+  <homepage>https://github.com/</homepage>
+  <textdomain>nelisp-ime</textdomain>
+  <engines>
+    <engine>
+      <name>nelisp-ime</name>
+      <longname>NeLisp Japanese</longname>
+      <language>ja</language>
+      <license>GPL-3.0-or-later</license>
+      <author>NeLisp contributors</author>
+      <layout>default</layout>
+      <symbol>Ne</symbol>
+      <description>Live Japanese conversion implemented in NeLisp</description>
+    </engine>
+  </engines>
+</component>

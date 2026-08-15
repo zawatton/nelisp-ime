@@ -1,0 +1,7 @@
+[InputMethod]
+Name=NeLisp Japanese
+Icon=input-keyboard
+Label=Ne
+LangCode=ja
+Addon=nelisp-ime
+Configurable=False
