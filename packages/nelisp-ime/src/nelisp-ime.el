@@ -257,6 +257,27 @@ engines replace it without changing the session or platform adapter APIs."
     (setq session (plist-put session :active-segment 0))
     (plist-put session :candidate-index 0)))
 
+(defvar nelisp-ime-candidate-limit 30
+  "Maximum candidates carried per list in a public snapshot, nil = all.
+
+Snapshots are produced on every keystroke and cross the JSON-RPC
+boundary; short readings can carry hundreds of homophones, and encoding
+them dominated live-conversion latency.  Candidate windows show far
+fewer, so snapshots truncate.  Selection operations index into the
+truncated list the adapter received, so they stay consistent.")
+
+(defun nelisp-ime--candidate-vector (candidates)
+  "Return CANDIDATES as a vector truncated to `nelisp-ime-candidate-limit'."
+  (let ((limit nelisp-ime-candidate-limit))
+    (if (and limit (> (length candidates) limit))
+        (let ((vector (make-vector limit nil))
+              (index 0))
+          (while (< index limit)
+            (aset vector index (nth index candidates))
+            (setq index (1+ index)))
+          vector)
+      (vconcat candidates))))
+
 (defun nelisp-ime--snapshot (session &optional commit)
   "Return the public representation of SESSION, optionally with COMMIT text."
   (list :consumed t
@@ -268,9 +289,11 @@ engines replace it without changing the session or platform adapter APIs."
          (mapcar (lambda (segment)
                    (let ((copy (copy-sequence segment)))
                      (plist-put copy :candidates
-                                (vconcat (or (plist-get copy :candidates) nil)))))
+                                (nelisp-ime--candidate-vector
+                                 (plist-get copy :candidates)))))
                  (or (plist-get session :segments) nil)))
-        :candidates (vconcat (or (plist-get session :candidates) nil))
+        :candidates (nelisp-ime--candidate-vector
+                     (plist-get session :candidates))
         :candidate-index (plist-get session :candidate-index)
         :active-segment (plist-get session :active-segment)
         :pending (plist-get session :pending)

@@ -161,6 +161,18 @@
     (should-error (nelisp-ime-learning-import '((symbol "value" 1)))
                   :type 'error)))
 
+(ert-deftest nelisp-ime-test-snapshot-truncates-candidates ()
+  (nelisp-ime-test--isolated
+    (setq nelisp-ime-dictionary '(("は" "端" "歯" "葉" "刃" "派")))
+    (let ((nelisp-ime-candidate-limit 2))
+      (nelisp-ime-session-open "s")
+      (let ((result (nelisp-ime-feed "s" '(:op :insert :text "は"))))
+        (should (equal (plist-get result :candidates) ["端" "歯"]))))
+    (let ((nelisp-ime-candidate-limit nil))
+      (nelisp-ime-session-open "s")
+      (let ((result (nelisp-ime-feed "s" '(:op :insert :text "は"))))
+        (should (= (length (plist-get result :candidates)) 5))))))
+
 (ert-deftest nelisp-ime-test-session-selects-registered-engine ()
   (nelisp-ime-test--isolated
     (let ((nelisp-ime-engines (copy-hash-table nelisp-ime-engines)))
