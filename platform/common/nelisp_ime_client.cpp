@@ -362,9 +362,17 @@ std::string Client::request(const std::string &method, const std::string &params
   return response;
 }
 
-void Client::openSession(const std::string &id, const std::string &style) {
-  request("ime/session.open", "{\"sessionId\":" + jsonQuote(id) +
-          ",\"inputStyle\":" + jsonQuote(style) + "}");
+void Client::openSession(const std::string &id, const std::string &style,
+                         const std::string &detail) {
+  std::string params = "{\"sessionId\":" + jsonQuote(id) +
+      ",\"inputStyle\":" + jsonQuote(style);
+  if (!detail.empty()) params += ",\"detail\":" + jsonQuote(detail);
+  request("ime/session.open", params + "}");
+}
+Snapshot Client::status(const std::string &id, const std::string &detail) {
+  std::string params = "{\"sessionId\":" + jsonQuote(id);
+  if (!detail.empty()) params += ",\"detail\":" + jsonQuote(detail);
+  return snapshotFromJson(request("ime/session.status", params + "}"));
 }
 void Client::closeSession(const std::string &id) {
   request("ime/session.close", "{\"sessionId\":" + jsonQuote(id) + "}");

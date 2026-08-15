@@ -25,8 +25,17 @@ public:
   Client &operator=(const Client &) = delete;
 
   void start();
+  // `detail' selects how much each snapshot carries: "compact" omits the
+  // candidate list and segment breakdown, which is what an adapter that only
+  // shows candidates on demand should use -- encoding cost tracks payload
+  // size on the standalone runtime.  Empty leaves the engine default (full).
   void openSession(const std::string &sessionId,
-                   const std::string &inputStyle = "romaji");
+                   const std::string &inputStyle = "romaji",
+                   const std::string &detail = "");
+  // Side-effect-free snapshot.  Pass detail="full" from a compact session to
+  // fetch the candidate list when opening a candidate window.
+  Snapshot status(const std::string &sessionId,
+                  const std::string &detail = "");
   void closeSession(const std::string &sessionId);
   Snapshot feedKey(const std::string &sessionId, const std::string &key);
   Snapshot feedOperation(const std::string &sessionId,

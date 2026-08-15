@@ -118,7 +118,11 @@ public:
       learningFile_ = envOr("LOCALAPPDATA", ".") + "/NeLispIME/learning.json";
       client_->loadLearning(learningFile_);
       sessionId_ = "tsf:" + std::to_string(GetCurrentThreadId());
-      client_->openSession(sessionId_, "romaji");
+      // Compact snapshots: this service only needs preedit and commit to
+      // paint a composition, and candidate/segment data is fetched on the
+      // first navigation key.  Encoding a full snapshot costs an order of
+      // magnitude more per keystroke on the standalone runtime.
+      client_->openSession(sessionId_, "romaji", "compact");
     } catch (...) { return E_FAIL; }
     return result;
   }
@@ -140,6 +144,12 @@ public:
     *eaten = FALSE;
     if (!client_ || !handles(key)) return S_OK;
     try {
+      // Navigation needs the lists a compact snapshot leaves out; pull them
+      // once, on demand, and reuse the cached copy for further navigation.
+      if ((key == VK_SPACE || key == VK_LEFT || key == VK_RIGHT) &&
+          !last_.preedit.empty() && last_.candidates.empty() &&
+          last_.segmentCount == 0)
+        last_ = client_->status(sessionId_, "full");
       nelisp_ime::Snapshot snapshot;
       if (key >= 'A' && key <= 'Z')
         snapshot = client_->feedKey(sessionId_, std::string(1, static_cast<char>(key - 'A' + 'a')));

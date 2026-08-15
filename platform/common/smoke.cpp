@@ -23,6 +23,16 @@ int main(int argc, char **argv) {
       for (char key : std::string("kyouhaiitenkidesu"))
         snapshot = client.feedKey("phrase-smoke", std::string(1, key));
       if (snapshot.preedit != "今日はいい天気です") return 7;
+      // A compact session paints the same composition without shipping the
+      // candidate and segment lists, and status(full) fetches them on demand.
+      client.openSession("compact-smoke", "romaji", "compact");
+      for (char key : std::string("kyouhaiitenkidesu"))
+        snapshot = client.feedKey("compact-smoke", std::string(1, key));
+      if (snapshot.preedit != "今日はいい天気です") return 8;
+      if (!snapshot.candidates.empty()) return 9;
+      nelisp_ime::Snapshot detailed = client.status("compact-smoke", "full");
+      if (detailed.preedit != "今日はいい天気です") return 10;
+      if (detailed.candidates.empty()) return 11;
     }
     {
       nelisp_ime::Client client(argv[1], argv[2]);
