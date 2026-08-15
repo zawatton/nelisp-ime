@@ -241,7 +241,11 @@ gloss beside the surface, so it must not be flattened away."
 
 Subsequent commits append to FILE's journal instead of rewriting the whole
 table; see `nelisp-ime-learning-compact'."
-  (let ((temporary (concat file ".tmp")))
+  (let ((temporary (concat file ".tmp"))
+        ;; Learning rows are Japanese, and the host default coding is
+        ;; locale-dependent: an encoding it cannot represent makes the write
+        ;; ask which coding system to use, which in batch mode fails outright.
+        (coding-system-for-write 'utf-8-unix))
     (make-directory (file-name-directory (expand-file-name file)) t)
     (with-temp-file temporary
       (let ((print-length nil) (print-level nil))
@@ -262,7 +266,8 @@ lost."
   (let ((rows (if (not (file-readable-p file))
                   0
                 (with-temp-buffer
-                  (insert-file-contents file)
+                  (let ((coding-system-for-read 'utf-8-unix))
+                    (insert-file-contents file))
                   (let* ((parsed (read-from-string (buffer-string)))
                          (rows (car parsed))
                          (end (cdr parsed)))
@@ -288,7 +293,11 @@ lost."
   "Append one learned READING and SURFACE selection to the journal."
   (when nelisp-ime-learning-journal-file
     (let ((line (let ((print-length nil) (print-level nil))
-                  (concat (prin1-to-string (list reading surface)) "\n"))))
+                  (concat (prin1-to-string (list reading surface)) "\n")))
+          ;; Same reason as `nelisp-ime-learning-save': the rows are Japanese
+          ;; and a host default coding that cannot encode them turns the write
+          ;; into a coding-system prompt, which fails outright in batch mode.
+          (coding-system-for-write 'utf-8-unix))
       (make-directory
        (file-name-directory
         (expand-file-name nelisp-ime-learning-journal-file))
@@ -301,7 +310,8 @@ lost."
         (replayed 0))
     (when (file-readable-p journal)
       (with-temp-buffer
-        (insert-file-contents journal)
+        (let ((coding-system-for-read 'utf-8-unix))
+          (insert-file-contents journal))
         (goto-char (point-min))
         (while (not (eobp))
           (let ((line (buffer-substring-no-properties
