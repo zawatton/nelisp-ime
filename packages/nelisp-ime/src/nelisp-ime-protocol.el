@@ -40,6 +40,13 @@
                               ("commit" . :commit) ("cancel" . :cancel)))))
     (or (cdr entry) (error "nelisp-ime: unsupported operation %S" value))))
 
+(defun nelisp-ime-protocol--detail (value)
+  "Translate JSON snapshot detail VALUE, or nil to leave it unset."
+  (cond ((or (null value) (eq value :null)) nil)
+        ((equal value "full") 'full)
+        ((equal value "compact") 'compact)
+        (t (error "nelisp-ime: unsupported snapshot detail %S" value))))
+
 (defun nelisp-ime-protocol--event (object)
   "Translate JSON event OBJECT into the core event plist."
   (list :op (nelisp-ime-protocol--operation (gethash "op" object))
@@ -63,7 +70,7 @@
             :modes (vconcat (mapcar #'symbol-name nelisp-ime-modes))
             :capabilities ["kana" "romaji" "live-conversion" "learning"
                            "multi-session" "engine-select" "mode-report"
-                           "session-reset" "maintenance"])))
+                           "session-reset" "maintenance" "compact-snapshot"])))
    ((equal method "ime/health") (list :ok t))
    ((equal method "ime/dictionary.load")
     ;; SKK dictionary loading belongs to the bundled lattice engine; keep
@@ -82,14 +89,18 @@
              (nelisp-ime-protocol--input-style (gethash "inputStyle" params))
              :context (gethash "context" params)
              :engine (and (stringp engine) (> (length engine) 0)
-                          (intern engine))))))
+                          (intern engine))
+             :detail (nelisp-ime-protocol--detail
+                      (gethash "detail" params))))))
    ((equal method "ime/session.close")
     (list :closed (nelisp-ime-session-close (gethash "sessionId" params))))
    ((equal method "ime/session.feed")
     (nelisp-ime-feed (gethash "sessionId" params)
                      (nelisp-ime-protocol--event (gethash "event" params))))
    ((equal method "ime/session.status")
-    (nelisp-ime-session-status (gethash "sessionId" params)))
+    (nelisp-ime-session-status (gethash "sessionId" params)
+                               (nelisp-ime-protocol--detail
+                                (gethash "detail" params))))
    ((equal method "ime/session.reset")
     (nelisp-ime-session-reset (gethash "sessionId" params)))
    ((equal method "ime/maintenance")
@@ -116,17 +127,17 @@
 
 (defun nelisp-ime-protocol--response (id result)
   "Encode successful RESULT for request ID."
-  (nelisp-json-encode
-   (nelisp-ime-protocol--object
-    "jsonrpc" "2.0" "id" id "result" result)))
+  ;; A plist, not a hash table: both encode to the same JSON, but building a
+  ;; hash table and walking it with `maphash' costs ~340ms per response on
+  ;; the standalone runtime regardless of payload size -- measured as the
+  ;; entire cost of encoding a snapshot.
+  (nelisp-json-encode (list :jsonrpc "2.0" :id id :result result)))
 
 (defun nelisp-ime-protocol--error (id error-data)
   "Encode ERROR-DATA for request ID."
   (nelisp-json-encode
-   (nelisp-ime-protocol--object
-    "jsonrpc" "2.0" "id" id
-    "error" (nelisp-ime-protocol--object
-             "code" -32603 "message" (format "%S" error-data)))))
+   (list :jsonrpc "2.0" :id id
+         :error (list :code -32603 :message (format "%S" error-data)))))
 
 (defun nelisp-ime-protocol-handle-json (line)
   "Handle one line-delimited JSON-RPC request LINE and return JSON."

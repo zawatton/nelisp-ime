@@ -385,5 +385,38 @@
             (should (= (nelisp-ime-learning-count "かな" "仮名") 1)))
         (delete-directory directory t)))))
 
+(ert-deftest nelisp-ime-test-compact-snapshot-omits-lists ()
+  (nelisp-ime-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸" "端")))
+    (nelisp-ime-session-open "s" '(:detail compact))
+    (let ((result (nelisp-ime-feed "s" '(:op :insert :text "はし"))))
+      ;; The composition itself still renders: only the lists are dropped.
+      (should (equal (plist-get result :preedit) "橋"))
+      (should (equal (plist-get result :reading) "はし"))
+      (should (equal (plist-get result :candidates) []))
+      (should (equal (plist-get result :segments) [])))))
+
+(ert-deftest nelisp-ime-test-compact-session-answers-selection-in-full ()
+  (nelisp-ime-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸" "端")))
+    (nelisp-ime-session-open "s" '(:detail compact))
+    (nelisp-ime-feed "s" '(:op :insert :text "はし"))
+    ;; Selecting needs the list being selected from, compact or not.
+    (let ((result (nelisp-ime-feed "s" '(:op :select-candidate :index 1))))
+      (should (equal (plist-get result :preedit) "箸"))
+      (should (> (length (plist-get result :candidates)) 1)))))
+
+(ert-deftest nelisp-ime-test-status-detail-overrides-session ()
+  (nelisp-ime-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸")))
+    (nelisp-ime-session-open "s" '(:detail compact))
+    (nelisp-ime-feed "s" '(:op :insert :text "はし"))
+    (should (equal (plist-get (nelisp-ime-session-status "s") :candidates) []))
+    (should (> (length (plist-get (nelisp-ime-session-status "s" 'full)
+                                  :candidates))
+               0))
+    ;; Asking for full must not make the session full from then on.
+    (should (equal (plist-get (nelisp-ime-session-status "s") :candidates) []))))
+
 (provide 'nelisp-ime-test)
 ;;; nelisp-ime-test.el ends here

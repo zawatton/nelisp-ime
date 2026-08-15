@@ -387,6 +387,27 @@ them dominated live-conversion latency.  Candidate windows show far
 fewer, so snapshots truncate.  Selection operations index into the
 truncated list the adapter received, so they stay consistent.")
 
+(defvar nelisp-ime-snapshot-detail 'full
+  "How much of the composition a snapshot carries: `full' or `compact'.
+
+A compact snapshot omits the candidate lists and the segment breakdown,
+keeping the reading, preedit, mode, and cursor an adapter needs to paint
+the composition.  It exists because encoding cost tracks payload size:
+one full snapshot of a sentence is ~1078 characters, and the standalone
+runtime charges roughly a millisecond per character to encode.
+
+Adapters that only open a candidate window on demand should run sessions
+compact and ask for a full snapshot with `nelisp-ime-session-status' when
+the window opens.  Selection operations always answer in full, because
+the adapter needs the list it is selecting from.  The default stays
+`full' so existing adapters keep working unchanged.")
+
+(defun nelisp-ime--compact-p (&optional session)
+  "Return non-nil when SESSION's snapshots omit candidates and segments."
+  (eq (or (and session (plist-get session :detail))
+          nelisp-ime-snapshot-detail)
+      'compact))
+
 (defun nelisp-ime--candidate-vector (candidates)
   "Return CANDIDATES as a vector truncated to `nelisp-ime-candidate-limit'."
   (let ((limit nelisp-ime-candidate-limit))
@@ -436,15 +457,19 @@ non-modal engine's mode indicator should show anyway."
           :cursor (length preedit)
           :composition-start (if composing 0 -1)
           :segments
-          (vconcat
-           (mapcar (lambda (segment)
-                     (let ((copy (copy-sequence segment)))
-                       (plist-put copy :candidates
-                                  (nelisp-ime--candidate-vector
-                                   (plist-get copy :candidates)))))
-                   (or (plist-get session :segments) nil)))
-          :candidates (nelisp-ime--candidate-vector
-                       (plist-get session :candidates))
+          (if (nelisp-ime--compact-p session)
+              []
+            (vconcat
+             (mapcar (lambda (segment)
+                       (let ((copy (copy-sequence segment)))
+                         (plist-put copy :candidates
+                                    (nelisp-ime--candidate-vector
+                                     (plist-get copy :candidates)))))
+                     (or (plist-get session :segments) nil))))
+          :candidates (if (nelisp-ime--compact-p session)
+                          []
+                        (nelisp-ime--candidate-vector
+                         (plist-get session :candidates)))
           :candidate-index (plist-get session :candidate-index)
           :active-segment (plist-get session :active-segment)
           :pending (plist-get session :pending)
@@ -469,6 +494,8 @@ session; omitting it defers to `nelisp-ime-converter-function' and then
                                           'kana)
                          :context (plist-get options :context)
                          :engine engine
+                         :detail (or (plist-get options :detail)
+                                     nelisp-ime-snapshot-detail)
                          :reading ""
                          :pending ""
                          :preedit ""
@@ -611,12 +638,18 @@ session; omitting it defers to `nelisp-ime-converter-function' and then
         (nelisp-ime--insert session-id session (plist-get event :text)))
        ((eq operation :backspace)
         (nelisp-ime--backspace session-id session))
+       ;; A selection answer must carry the list being selected from, so
+       ;; these two ignore a compact session.
        ((eq operation :select-candidate)
-        (nelisp-ime--select-candidate session-id session
-                                      (plist-get event :index)))
+        (let ((nelisp-ime-snapshot-detail 'full))
+          (nelisp-ime--select-candidate session-id
+                                        (plist-put session :detail 'full)
+                                        (plist-get event :index))))
        ((eq operation :select-segment)
-        (nelisp-ime--select-segment session-id session
-                                    (plist-get event :index)))
+        (let ((nelisp-ime-snapshot-detail 'full))
+          (nelisp-ime--select-segment session-id
+                                      (plist-put session :detail 'full)
+                                      (plist-get event :index))))
        ((eq operation :commit)
         (nelisp-ime--finish session-id session t))
        ((eq operation :cancel)
@@ -679,12 +712,17 @@ open with its input style, context, and engine intact."
     (nelisp-ime--snapshot empty)))
 
 ;;;###autoload
-(defun nelisp-ime-session-status (session-id)
+(defun nelisp-ime-session-status (session-id &optional detail)
   "Return the snapshot for SESSION-ID without changing any state.
 
 Mode indicators and language-bar buttons poll this; making it explicitly
-side-effect free keeps such polling from perturbing composition."
-  (nelisp-ime--snapshot (nelisp-ime--session session-id)))
+side-effect free keeps such polling from perturbing composition.  DETAIL
+overrides the session's own setting, so an adapter running compact
+sessions asks for `full' when it opens a candidate window."
+  (let ((session (nelisp-ime--session session-id)))
+    (nelisp-ime--snapshot (if detail
+                              (plist-put (copy-sequence session) :detail detail)
+                            session))))
 
 ;;;###autoload
 (defun nelisp-ime-maintain (operation &optional engine-name)
