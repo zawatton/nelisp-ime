@@ -21,6 +21,16 @@ export TMPDIR ?= /tmp
 export TEMP   ?= /tmp
 export TMP    ?= /tmp
 
+# make on MSYS also drops NELISP_STANDALONE_TARGET from the inherited
+# environment before it reaches the (native mingw64) Emacs subprocess, so
+# `NELISP_STANDALONE_TARGET=windows-x86_64 make standalone-reader' silently
+# builds the linux-x86_64 default on a Windows host.  Accept the target as a
+# make variable too, and re-export it only when non-empty so the empty-string
+# export cannot shadow the script's linux-x86_64 default.
+ifneq ($(NELISP_STANDALONE_TARGET),)
+export NELISP_STANDALONE_TARGET
+endif
+
 # Sorted so `nelisp-read.el' is compiled before `nelisp.el' (the latter
 # requires the former at byte-compile time).  Glob pattern matches both
 # `nelisp.el' and `nelisp-FOO.el'.
