@@ -1,6 +1,20 @@
-#+TITLE: NeLisp — Self-Hosted Emacs Lisp VM (v0.6.0)
+#+TITLE: Portable NeLisp Japanese IME
 #+AUTHOR: zawatton
 #+DATE: 2026-06-26
+
+* NeLisp IME
+
+This repository contains a portable Japanese input method whose conversion
+engine is implemented in Elisp and runs on standalone NeLisp.  Native adapters
+integrate the same engine with macOS InputMethodKit, Linux Fcitx 5/IBus, and
+Windows TSF.
+
+- Start with [[file:packages/nelisp-ime/README.org][the engine and protocol documentation]].
+- See [[file:platform/README.md][the platform adapter and installation overview]].
+- The remainder of this document describes the bundled NeLisp runtime used to
+  build and run the engine.
+
+* Bundled NeLisp runtime
 
 #+begin_quote
 *Note on language:* I'm a non-native English speaker. The phrasing in
