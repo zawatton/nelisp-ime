@@ -19,8 +19,17 @@ LONG objectCount;
 LONG serverLocks;
 
 std::string envOr(const char *name, const char *fallback) {
+#ifdef _MSC_VER
+  char *value = nullptr;
+  size_t length = 0;
+  if (_dupenv_s(&value, &length, name) != 0 || !value) return fallback;
+  std::string result = *value ? value : fallback;
+  std::free(value);
+  return result;
+#else
   const char *value = std::getenv(name);
   return value && *value ? value : fallback;
+#endif
 }
 std::wstring utf16(const std::string &value) {
   if (value.empty()) return {};
@@ -338,15 +347,15 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) { moduleHandle = instance; DisableThreadLibraryCalls(instance); }
   return TRUE;
 }
-extern "C" __declspec(dllexport) HRESULT __stdcall DllCanUnloadNow() {
+STDAPI DllCanUnloadNow(void) {
   return objectCount == 0 && serverLocks == 0 ? S_OK : S_FALSE;
 }
-extern "C" __declspec(dllexport) HRESULT __stdcall DllGetClassObject(REFCLSID clsid, REFIID iid, void **out) {
+STDAPI DllGetClassObject(REFCLSID clsid, REFIID iid, LPVOID *out) {
   if (clsid != CLSID_NelispIme) return CLASS_E_CLASSNOTAVAILABLE;
   auto *factory = new ClassFactory;
   HRESULT result = factory->QueryInterface(iid, out); factory->Release(); return result;
 }
-extern "C" __declspec(dllexport) HRESULT __stdcall DllRegisterServer() {
+STDAPI DllRegisterServer(void) {
   HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   HRESULT result = registerCom(true);
   if (SUCCEEDED(result)) result = registerProfile(true);
@@ -354,7 +363,7 @@ extern "C" __declspec(dllexport) HRESULT __stdcall DllRegisterServer() {
   if (SUCCEEDED(initialized)) CoUninitialize();
   return result;
 }
-extern "C" __declspec(dllexport) HRESULT __stdcall DllUnregisterServer() {
+STDAPI DllUnregisterServer(void) {
   HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   registerCategory(false); registerProfile(false);
   HRESULT result = registerCom(false);
