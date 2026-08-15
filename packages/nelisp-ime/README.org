@@ -1,5 +1,9 @@
 #+TITLE: Portable NeLisp Japanese IME
 
+This package is developed in the standalone =nelisp-ime= repository.  The
+repository includes the NeLisp runtime needed to build and test the IME
+adapters on macOS, Linux, and Windows.
+
 * Overview
 
 =nelisp-ime= is a Japanese conversion engine implemented in Elisp and runnable
