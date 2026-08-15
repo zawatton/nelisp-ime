@@ -208,10 +208,14 @@
            (file (expand-file-name "SKK-JISYO.test" directory)))
       (unwind-protect
           (progn
-            (with-temp-file file
-              (insert ";; okuri-nasi entries.\n")
-              (insert "かな /仮名;annotation/かな/\n")
-              (insert "おくr /送/\n"))
+            ;; The loader below reads with an explicit utf-8, so pin the
+            ;; write coding too — the host default is locale-dependent
+            ;; (e.g. japanese-shift-jis-dos on Japanese Windows).
+            (let ((coding-system-for-write 'utf-8-unix))
+              (with-temp-file file
+                (insert ";; okuri-nasi entries.\n")
+                (insert "かな /仮名;annotation/かな/\n")
+                (insert "おくr /送/\n")))
             (should (= (nelisp-ime-dictionary-load-skk file 'utf-8) 1))
             (let ((result (nelisp-ime-lattice-convert "かな" nil)))
               (should (equal (plist-get result :preedit) "仮名"))
@@ -225,9 +229,12 @@
            (file (expand-file-name "SKK-JISYO.okuri" directory)))
       (unwind-protect
           (progn
-            (with-temp-file file
-              (insert "いk /行/\n")
-              (insert "はなs /話/\n"))
+            ;; Pin the write coding to match the loader's explicit utf-8
+            ;; (the host default may be a non-UTF-8 DOS coding).
+            (let ((coding-system-for-write 'utf-8-unix))
+              (with-temp-file file
+                (insert "いk /行/\n")
+                (insert "はなs /話/\n")))
             (nelisp-ime-dictionary-load-skk file 'utf-8 t)
             (should (equal (plist-get (nelisp-ime-lattice-convert "いきます" nil)
                                       :preedit)
