@@ -177,12 +177,14 @@ gloss beside the surface, so it must not be flattened away."
   (cond
    ((stringp candidate) (list :surface candidate :cost (+ 100 (* rank 10))))
    ((and (listp candidate) (stringp (plist-get candidate :surface)))
-    (let ((normalized
-           (list :surface (plist-get candidate :surface)
-                 :cost (or (plist-get candidate :cost) (+ 100 (* rank 10))))))
-      (if (plist-get candidate :annotation)
-          (append normalized (list :annotation (plist-get candidate :annotation)))
-        normalized)))
+    ;; Preserve every engine-supplied key, not just the two the framework
+    ;; owns: SKK dictionaries gloss homophones with :annotation and lattice
+    ;; engines carry part-of-speech and connection ids for path scoring, and
+    ;; all of it has to survive normalization to reach the candidate window.
+    (let ((normalized (copy-sequence candidate)))
+      (plist-put normalized :cost
+                 (or (plist-get normalized :cost) (+ 100 (* rank 10))))
+      normalized))
    (t (error "nelisp-ime: invalid dictionary candidate %S" candidate))))
 
 (defun nelisp-ime--learning-key (reading surface)
