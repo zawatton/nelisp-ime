@@ -50,6 +50,35 @@ Events support =:key=, =:insert=, =:backspace=, =:select-segment=,
 =:select-candidate=, =:commit=, and =:cancel=.  Snapshots contain only portable
 Lisp/JSON values.
 
+A snapshot carries =:consumed=, =:reading=, =:preedit=, =:mode=, =:cursor=,
+=:composition-start=, =:segments=, =:candidates=, =:candidate-index=,
+=:active-segment=, =:pending=, and =:commit=.  =:composition-start= is =-1=
+when no composition is open, which lets an adapter distinguish a direct
+commit from an empty one.
+
+* Robustness and housekeeping
+
+An input method that signals mid-keystroke leaves the user unable to type,
+so =nelisp-ime-feed= degrades instead: on an engine or event error it
+returns the session's snapshot with =:consumed nil= and an =:error= string,
+telling the adapter to pass the key through to the application.  Bind
+=nelisp-ime-fail-open= to nil in engine development to surface the error.
+
+- =nelisp-ime-session-status= returns a snapshot with no side effects, so
+  mode indicators can poll without perturbing composition.
+- =nelisp-ime-session-reset= discards composition state but keeps the
+  session (its input style, context, and engine) — adapters call it to
+  resynchronize after the application terminated a composition.
+- =nelisp-ime-maintain= runs engine housekeeping (=gc=, =compact=) off the
+  input path; engines without a =:maintain= hook return nil.
+- Learning commits append one line to a journal
+  (=nelisp-ime-learning-journal-append=) instead of rewriting the whole
+  table; =nelisp-ime-learning-load= replays it and
+  =nelisp-ime-learning-compact= folds and truncates it during idle time.
+
+The protocol exposes the same surface: =ime/session.status=,
+=ime/session.reset=, =ime/maintenance=, and =ime/learning.compact=.
+
 * Architecture
 
 #+begin_example
@@ -88,6 +117,14 @@ adapters are engine-agnostic.  Conversion itself is pluggable:
   every EVENT before the default composition pipeline and returns the
   snapshot itself; such an engine may omit =:convert=.
 - =:learn= (optional) replaces the framework frequency learning on commit.
+- =:mode= (optional) receives SESSION and returns the input mode reported
+  in snapshots, one of =nelisp-ime-modes= (=hiragana katakana latin
+  wide-latin abbrev preedit candidate=).  Modal engines supply this so mode
+  indicators and language-bar buttons track the engine, not a guess.
+- =:reset= (optional) receives SESSION-ID and SESSION and discards
+  engine-side composition state without closing the session.
+- =:maintain= (optional) receives an operation symbol (=gc=, =compact=) and
+  performs engine housekeeping off the input path.
 - Sessions that do not select an engine use =nelisp-ime-converter-function=
   when set, then =nelisp-ime-default-engine= (default =lattice=).
 - Over the protocol, =ime/session.open= accepts an optional ="engine"= field

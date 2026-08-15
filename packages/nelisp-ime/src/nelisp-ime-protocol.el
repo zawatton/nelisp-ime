@@ -60,8 +60,10 @@
             :engine "nelisp-ime"
             :engines (vconcat (mapcar #'symbol-name
                                       (nelisp-ime-engine-names)))
+            :modes (vconcat (mapcar #'symbol-name nelisp-ime-modes))
             :capabilities ["kana" "romaji" "live-conversion" "learning"
-                           "multi-session" "engine-select"])))
+                           "multi-session" "engine-select" "mode-report"
+                           "session-reset" "maintenance"])))
    ((equal method "ime/health") (list :ok t))
    ((equal method "ime/dictionary.load")
     ;; SKK dictionary loading belongs to the bundled lattice engine; keep
@@ -86,6 +88,22 @@
    ((equal method "ime/session.feed")
     (nelisp-ime-feed (gethash "sessionId" params)
                      (nelisp-ime-protocol--event (gethash "event" params))))
+   ((equal method "ime/session.status")
+    (nelisp-ime-session-status (gethash "sessionId" params)))
+   ((equal method "ime/session.reset")
+    (nelisp-ime-session-reset (gethash "sessionId" params)))
+   ((equal method "ime/maintenance")
+    (let ((operation (gethash "operation" params))
+          (engine (gethash "engine" params)))
+      (unless (stringp operation)
+        (error "nelisp-ime: maintenance requires an operation"))
+      (list :operation operation
+            :result (nelisp-ime-maintain
+                     (intern operation)
+                     (and (stringp engine) (> (length engine) 0)
+                          (intern engine))))))
+   ((equal method "ime/learning.compact")
+    (list :rows (nelisp-ime-learning-compact (gethash "file" params))))
    ((equal method "ime/learning.load")
     (list :rows (nelisp-ime-learning-load (gethash "file" params))))
    ((equal method "ime/learning.save")
