@@ -2,6 +2,7 @@
 
 (require 'ert)
 (require 'nelisp-ime)
+(require 'nelisp-ime-lattice)
 
 (defmacro nelisp-ime-test--isolated (&rest body)
   "Run BODY with isolated sessions and dictionary."
@@ -243,6 +244,66 @@
                                       :preedit)
                            "話した")))
         (delete-directory directory t)))))
+
+(ert-deftest nelisp-ime-test-session-selects-registered-engine ()
+  (nelisp-ime-test--isolated
+    (let ((nelisp-ime-engines (copy-hash-table nelisp-ime-engines)))
+      (nelisp-ime-engine-register
+       'upcase-test
+       :convert (lambda (reading _context)
+                  (list :preedit (upcase reading)
+                        :candidates (list (upcase reading))
+                        :segments nil)))
+      (nelisp-ime-session-open "s" '(:input-style romaji :engine upcase-test))
+      (should (equal (plist-get
+                      (nelisp-ime-feed "s" '(:op :insert :text "abc"))
+                      :preedit)
+                     "ABC")))))
+
+(ert-deftest nelisp-ime-test-feed-hook-intercepts-events ()
+  (nelisp-ime-test--isolated
+    (let ((nelisp-ime-engines (copy-hash-table nelisp-ime-engines)))
+      (nelisp-ime-engine-register
+       'modal-test
+       :feed (lambda (_session-id _session event)
+               (list :consumed t
+                     :preedit (format "modal:%s" (plist-get event :op)))))
+      (nelisp-ime-session-open "s" '(:engine modal-test))
+      (should (equal (plist-get
+                      (nelisp-ime-feed "s" '(:op :insert :text "x"))
+                      :preedit)
+                     "modal::insert")))))
+
+(ert-deftest nelisp-ime-test-open-rejects-unknown-engine ()
+  (nelisp-ime-test--isolated
+    (should-error (nelisp-ime-session-open "s" '(:engine no-such-engine))
+                  :type 'error)))
+
+(ert-deftest nelisp-ime-test-default-engine-used-without-converter ()
+  (nelisp-ime-test--isolated
+    (setq nelisp-ime-converter-function nil)
+    (let ((nelisp-ime-default-engine 'lattice))
+      (setq nelisp-ime-dictionary '(("はし" "橋" "箸")))
+      (nelisp-ime-session-open "s")
+      (should (equal (plist-get
+                      (nelisp-ime-feed "s" '(:op :insert :text "はし"))
+                      :preedit)
+                     "橋")))))
+
+(ert-deftest nelisp-ime-test-engine-learn-hook-replaces-framework-learning ()
+  (nelisp-ime-test--isolated
+    (let ((nelisp-ime-engines (copy-hash-table nelisp-ime-engines))
+          (learned nil))
+      (nelisp-ime-engine-register
+       'learn-test
+       :convert #'nelisp-ime-dictionary-convert
+       :learn (lambda (segments) (setq learned segments)))
+      (setq nelisp-ime-dictionary '(("はし" "橋")))
+      (nelisp-ime-session-open "s" '(:engine learn-test))
+      (nelisp-ime-feed "s" '(:op :insert :text "はし"))
+      (nelisp-ime-feed "s" '(:op :commit))
+      (should learned)
+      (should (= (nelisp-ime-learning-count "はし" "橋") 0)))))
 
 (provide 'nelisp-ime-test)
 ;;; nelisp-ime-test.el ends here

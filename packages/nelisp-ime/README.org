@@ -25,12 +25,19 @@ The current engine provides:
 
 * Public API
 
+Framework core (=nelisp-ime.el=):
+
 - =nelisp-ime-session-open= / =nelisp-ime-session-close=
 - =nelisp-ime-feed=
-- =nelisp-ime-lattice-convert=
-- =nelisp-ime-dictionary-install= / =nelisp-ime-dictionary-load-skk=
+- =nelisp-ime-engine-register= / =nelisp-ime-engine-get= / =nelisp-ime-engine-names=
+- =nelisp-ime-default-engine= (variable, default =lattice=)
 - =nelisp-ime-learning-import= / =nelisp-ime-learning-export=
 - =nelisp-ime-protocol-handle-json=
+
+Bundled lattice engine (=nelisp-ime-lattice.el=):
+
+- =nelisp-ime-lattice-convert=
+- =nelisp-ime-dictionary-install= / =nelisp-ime-dictionary-load-skk=
 
 #+begin_src emacs-lisp
 (nelisp-ime-session-open "macos:42" '(:input-style kana))
@@ -58,6 +65,43 @@ InputMethodKit / Fcitx 5 or IBus / TSF
 The generated dictionary file is used by standalone NeLisp because raw SKK
 files require encoding and editor-buffer facilities.  See =data/README.md= for
 regeneration and larger-dictionary substitution.
+
+* Conversion engines
+
+=nelisp-ime= is an IME *framework*: sessions, reading accumulation, candidate
+and segment selection, learning, the JSON-RPC boundary, and the platform
+adapters are engine-agnostic.  Conversion itself is pluggable:
+
+#+begin_src emacs-lisp
+(nelisp-ime-engine-register 'my-engine
+                            :convert #'my-engine-convert   ; reading context -> plist
+                            :learn   #'my-engine-learn)    ; optional, segments ->
+(nelisp-ime-session-open "tsf:1" '(:input-style romaji :engine my-engine))
+#+end_src
+
+- =:convert= receives READING and CONTEXT and returns a plist with
+  =:preedit=, =:candidates=, and =:segments= — the same contract as
+  =nelisp-ime-converter-function=.
+- =:feed= (for modal engines such as SKK) receives SESSION-ID, SESSION, and
+  every EVENT before the default composition pipeline and returns the
+  snapshot itself; such an engine may omit =:convert=.
+- =:learn= (optional) replaces the framework frequency learning on commit.
+- Sessions that do not select an engine use =nelisp-ime-converter-function=
+  when set, then =nelisp-ime-default-engine= (default =lattice=).
+- Over the protocol, =ime/session.open= accepts an optional ="engine"= field
+  and =ime/initialize= reports registered names in ="engines"=.
+
+Bundled engines:
+
+| Name         | File                   | Behavior                                    |
+|--------------+------------------------+---------------------------------------------|
+| =lattice=    | =nelisp-ime-lattice.el= | Minimum-cost dictionary lattice + SKK loader |
+| =dictionary= | =nelisp-ime.el=         | Exact-reading alist lookup (reference)       |
+
+The lattice engine (and its SKK dictionary tooling and generated data) is
+scheduled to move to its own repository; this package then keeps only the
+framework plus the tiny reference engine, and IMEs such as an SKK-style modal
+engine plug in as separate packages.
 
 * Validation
 

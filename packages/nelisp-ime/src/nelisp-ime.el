@@ -1,4 +1,4 @@
-;;; nelisp-ime.el --- Portable NeLisp input method engine core  -*- lexical-binding: t; -*-
+;;; nelisp-ime.el --- Portable NeLisp input method framework core  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -8,6 +8,15 @@
 ;; OS-independent input method sessions.  Platform adapters normalize native
 ;; key events before calling this package and render the returned snapshot with
 ;; InputMethodKit, Fcitx/IBus, or TSF.
+;;
+;; This file is the engine-agnostic framework: composition sessions, reading
+;; accumulation (kana and romaji), candidate/segment selection, frequency
+;; learning, and the engine registry.  Conversion itself is pluggable — an
+;; engine registers a `:convert' function under a name (see
+;; `nelisp-ime-engine-register'), sessions select one with the `:engine'
+;; option, and `nelisp-ime-default-engine' names the fallback.  The bundled
+;; minimum-cost lattice engine lives in `nelisp-ime-lattice' and registers
+;; itself as `lattice'.
 
 ;;; Code:
 
@@ -15,7 +24,7 @@
 (require 'nelisp-ime-input)
 
 (defgroup nelisp-ime nil
-  "Portable input method engine core."
+  "Portable input method framework core."
   :group 'nelisp
   :prefix "nelisp-ime-")
 
@@ -28,50 +37,96 @@
 A candidate may be a surface string or a plist containing :surface and
 :cost.  Lower costs win.  String candidates receive costs from their order.")
 
-(defvar nelisp-ime-dictionary-index (make-hash-table :test 'equal)
-  "Indexed dictionary populated by `nelisp-ime-dictionary-load-skk'.")
-
-(defvar nelisp-ime-system-candidates
-  '(("は" "は") ("へ" "へ") ("を" "を") ("に" "に") ("の" "の")
-    ("が" "が") ("と" "と") ("で" "で") ("も" "も") ("や" "や")
-    ("か" "か") ("ね" "ね") ("よ" "よ") ("です" "です")
-    ("ます" "ます") ("でした" "でした") ("ました" "ました")
-    ("する" "する") ("します" "します") ("して" "して") ("した" "した")
-    ("いる" "いる") ("ある" "ある") ("ない" "ない")
-    ("いい" "いい"))
-  "Readings whose grammatical kana form must precede dictionary homophones.")
-
-(defvar nelisp-ime-unknown-cost 10000
-  "Cost assigned to one unknown kana character in lattice conversion.")
-
-(defconst nelisp-ime-infinity 1000000000000
-  "Portable unreachable-path cost for the conversion lattice.")
-
 (defvar nelisp-ime-learning (make-hash-table :test 'equal)
   "Selection frequencies keyed by a reading and surface pair.")
 
 (defvar nelisp-ime-learning-weight 100
   "Cost reduction applied for each learned candidate selection.")
 
-(defvar nelisp-ime-converter-function #'nelisp-ime-lattice-convert
-  "Function called with READING and CONTEXT to produce a conversion plist.")
+(defvar nelisp-ime-converter-function nil
+  "Function called with READING and CONTEXT to produce a conversion plist.
 
-(defun nelisp-ime--check-session-id (session-id)
-  "Require SESSION-ID to be a non-empty string."
-  (unless (and (stringp session-id) (> (length session-id) 0))
-    (error "nelisp-ime: session id must be a non-empty string")))
+When non-nil this overrides `nelisp-ime-default-engine' for sessions that
+did not select an engine explicitly.  Prefer registering an engine with
+`nelisp-ime-engine-register'; this variable remains as the low-level hook.")
 
-(defun nelisp-ime--session (session-id)
-  "Return SESSION-ID state or signal an error when it is not open."
-  (or (gethash session-id nelisp-ime-sessions)
-      (error "nelisp-ime: unknown session %s" session-id)))
+;;; Engine registry
+
+(defvar nelisp-ime-engines (make-hash-table :test 'eq)
+  "Registered conversion engines keyed by symbol name.")
+
+(defvar nelisp-ime-default-engine 'lattice
+  "Engine used by sessions that do not select one explicitly.
+
+The name only takes effect once an engine registers under it, so the
+framework loads without any engine and adapters may swap the default before
+or after engines load.")
+
+;;;###autoload
+(defun nelisp-ime-engine-register (name &rest hooks)
+  "Register conversion engine NAME with HOOKS and return NAME.
+
+NAME is a symbol.  HOOKS is a plist:
+  :convert  function of READING and CONTEXT returning a plist with
+            :preedit, :candidates, and :segments — the same contract as
+            `nelisp-ime-converter-function'.
+  :feed     function of SESSION-ID, SESSION, and EVENT returning a public
+            snapshot.  A modal engine (SKK-style) that owns key handling
+            supplies this to intercept every event before the framework's
+            default composition pipeline; such an engine may omit :convert.
+  :learn    (optional) function of SEGMENTS called on commit in place of
+            the framework frequency learning.
+
+At least one of :convert or :feed is required.  Registering NAME again
+replaces the previous definition."
+  (unless (symbolp name)
+    (error "nelisp-ime: engine name must be a symbol"))
+  (unless (or (functionp (plist-get hooks :convert))
+              (functionp (plist-get hooks :feed)))
+    (error "nelisp-ime: engine %s requires :convert or :feed" name))
+  (puthash name (append (list :name name) hooks) nelisp-ime-engines)
+  name)
+
+(defun nelisp-ime-engine-get (name)
+  "Return the engine plist registered under symbol NAME, or nil."
+  (and (symbolp name) name (gethash name nelisp-ime-engines)))
+
+(defun nelisp-ime-engine-names ()
+  "Return registered engine names sorted by `string<'."
+  (let (names)
+    (maphash (lambda (name _engine) (push name names)) nelisp-ime-engines)
+    (sort names (lambda (left right)
+                  (string< (symbol-name left) (symbol-name right))))))
+
+(defun nelisp-ime--session-engine (session)
+  "Return the engine plist governing SESSION, or nil for the legacy hook.
+
+Resolution order: the session's :engine name, then
+`nelisp-ime-converter-function' (which returns nil here so the caller uses
+the hook directly), then `nelisp-ime-default-engine'."
+  (let ((name (plist-get session :engine)))
+    (cond
+     (name (or (nelisp-ime-engine-get name)
+               (error "nelisp-ime: unknown engine %s" name)))
+     (nelisp-ime-converter-function nil)
+     (t (nelisp-ime-engine-get nelisp-ime-default-engine)))))
+
+(defun nelisp-ime--convert (session reading context)
+  "Convert READING with CONTEXT using the engine governing SESSION."
+  (let ((engine (nelisp-ime--session-engine session)))
+    (funcall (or (and engine (plist-get engine :convert))
+                 nelisp-ime-converter-function
+                 #'nelisp-ime-dictionary-convert)
+             reading context)))
+
+;;; Reference exact-match engine
 
 (defun nelisp-ime-dictionary-convert (reading _context)
   "Convert READING using `nelisp-ime-dictionary'.
 
 The first candidate is the live preedit.  An unknown reading remains kana.
-This exact-reading converter is intentionally small; a lattice converter can
-replace it without changing the session or platform adapter APIs."
+This exact-reading converter is intentionally small; lattice or modal
+engines replace it without changing the session or platform adapter APIs."
   (let ((candidates (cdr (assoc reading nelisp-ime-dictionary))))
     (list :preedit (or (car candidates) reading)
           :candidates (or candidates (and (> (length reading) 0)
@@ -81,6 +136,11 @@ replace it without changing the session or platform adapter APIs."
                                      :reading reading
                                      :candidate (or (car candidates)
                                                     reading)))))))
+
+(nelisp-ime-engine-register 'dictionary
+                            :convert #'nelisp-ime-dictionary-convert)
+
+;;; Shared candidate and learning helpers
 
 (defun nelisp-ime--candidate-normalize (candidate rank)
   "Return a normalized candidate plist for CANDIDATE at RANK."
@@ -100,126 +160,6 @@ replace it without changing the session or platform adapter APIs."
   (or (gethash (nelisp-ime--learning-key reading surface)
                nelisp-ime-learning)
       0))
-
-(defun nelisp-ime--dictionary-candidates (reading)
-  "Return normalized dictionary candidates for READING."
-  (let ((items (append (cdr (assoc reading nelisp-ime-system-candidates))
-                       (or (gethash reading nelisp-ime-dictionary-index)
-                           (cdr (assoc reading nelisp-ime-dictionary)))))
-        (rank 0)
-        seen
-        result)
-    (dolist (item items)
-      (let* ((candidate (nelisp-ime--candidate-normalize item rank))
-             (surface (plist-get candidate :surface))
-             (learned (nelisp-ime-learning-count reading surface)))
-        (unless (member surface seen)
-          (push surface seen)
-          (setq candidate
-                (plist-put candidate :cost
-                           (- (plist-get candidate :cost)
-                              (* learned nelisp-ime-learning-weight))))
-          (push candidate result)))
-      (setq rank (1+ rank)))
-    (sort result (lambda (left right)
-                   (< (plist-get left :cost) (plist-get right :cost))))))
-
-(defun nelisp-ime--skk-candidate (value)
-  "Return plain candidate text from SKK VALUE, or nil if unsupported."
-  (let* ((annotation (string-match ";" value))
-         (surface (if annotation (substring value 0 annotation) value)))
-    (when (and (> (length surface) 0)
-               (not (= (aref surface 0) 40)))
-      surface)))
-
-(defconst nelisp-ime--okuri-forms
-  '(("k" ("く" . "く") ("かない" . "かない") ("きます" . "きます")
-     ("いた" . "いた") ("いて" . "いて") ("けば" . "けば") ("こう" . "こう"))
-    ("g" ("ぐ" . "ぐ") ("がない" . "がない") ("ぎます" . "ぎます")
-     ("いだ" . "いだ") ("いで" . "いで") ("げば" . "げば") ("ごう" . "ごう"))
-    ("s" ("す" . "す") ("さない" . "さない") ("します" . "します")
-     ("した" . "した") ("して" . "して") ("せば" . "せば") ("そう" . "そう"))
-    ("t" ("つ" . "つ") ("たない" . "たない") ("ちます" . "ちます")
-     ("った" . "った") ("って" . "って") ("てば" . "てば") ("とう" . "とう"))
-    ("n" ("ぬ" . "ぬ") ("なない" . "なない") ("にます" . "にます")
-     ("んだ" . "んだ") ("んで" . "んで") ("ねば" . "ねば") ("のう" . "のう"))
-    ("b" ("ぶ" . "ぶ") ("ばない" . "ばない") ("びます" . "びます")
-     ("んだ" . "んだ") ("んで" . "んで") ("べば" . "べば") ("ぼう" . "ぼう"))
-    ("m" ("む" . "む") ("まない" . "まない") ("みます" . "みます")
-     ("んだ" . "んだ") ("んで" . "んで") ("めば" . "めば") ("もう" . "もう"))
-    ("w" ("う" . "う") ("わない" . "わない") ("います" . "います")
-     ("った" . "った") ("って" . "って") ("えば" . "えば") ("おう" . "おう"))
-    ("r" ("る" . "る") ("らない" . "らない") ("ります" . "ります")
-     ("った" . "った") ("って" . "って") ("れば" . "れば") ("ろう" . "ろう"))
-    ("i" ("い" . "い") ("くない" . "くない") ("かった" . "かった")
-     ("くて" . "くて") ("ければ" . "ければ") ("そう" . "そう")))
-  "Conservative conjugation forms used to expand SKK okuri entries.")
-
-(defun nelisp-ime--skk-expand-okuri (reading candidates table)
-  "Expand okuri-ari READING and CANDIDATES into TABLE."
-  (let* ((end (1- (length reading)))
-         (base (substring reading 0 end))
-         (code (substring reading end))
-         (forms (cdr (assoc code nelisp-ime--okuri-forms))))
-    (dolist (form forms)
-      (let ((key (concat base (car form)))
-            surfaces)
-        (dolist (candidate candidates)
-          (push (concat candidate (cdr form)) surfaces))
-        (puthash key (append (gethash key table) (nreverse surfaces)) table)))))
-
-(defun nelisp-ime--skk-line (line table expand-okuri)
-  "Parse one SKK dictionary LINE into TABLE."
-  (unless (or (= (length line) 0) (= (aref line 0) ?\;))
-    (let ((space (string-match " " line)))
-      (when space
-        (let* ((reading (substring line 0 space))
-               (body (substring line (1+ space)))
-               (parts (split-string body "/" t))
-               candidates)
-          (dolist (part parts)
-            (let ((candidate (nelisp-ime--skk-candidate part)))
-              (when candidate (push candidate candidates))))
-          (setq candidates (nreverse candidates))
-          (when candidates
-            (if (and (> (length reading) 0)
-                     (< (aref reading (1- (length reading))) 128))
-                (when expand-okuri
-                  (nelisp-ime--skk-expand-okuri reading candidates table))
-              (puthash reading candidates table))))))))
-
-(defun nelisp-ime-dictionary-install (entries)
-  "Install portable dictionary ENTRIES and return their count.
-
-ENTRIES is an alist whose keys are readings and whose values are candidate
-lists.  This representation can be loaded by standalone NeLisp without
-depending on editor buffer primitives."
-  (let ((table (make-hash-table :test 'equal)))
-    (dolist (entry entries)
-      (puthash (car entry) (cdr entry) table))
-    (setq nelisp-ime-dictionary-index table)
-    (hash-table-count table)))
-
-;;;###autoload
-(defun nelisp-ime-dictionary-load-skk (file &optional coding expand-okuri)
-  "Load SKK dictionary FILE into an indexed table and return entry count.
-
-CODING defaults to euc-jp, the canonical SKK distribution encoding.  Lisp
-expression candidates are ignored; plain candidates and annotations are safe."
-  (let ((coding-system-for-read (or coding 'euc-jp))
-        (table (make-hash-table :test 'equal)))
-    (with-temp-buffer
-      (insert-file-contents file)
-      (goto-char (point-min))
-      (while (< (point) (point-max))
-        (let ((start (point))
-              (end (line-end-position)))
-          (forward-line 1)
-          (nelisp-ime--skk-line
-           (buffer-substring-no-properties start end)
-           table expand-okuri))))
-    (setq nelisp-ime-dictionary-index table)
-    (hash-table-count table)))
 
 (defun nelisp-ime--learn-segments (segments)
   "Increase selection frequencies represented by SEGMENTS."
@@ -287,70 +227,17 @@ expression candidates are ignored; plain candidates and annotations are safe."
           (error "nelisp-ime: trailing learning data"))
         (nelisp-ime-learning-import rows)))))
 
-(defun nelisp-ime--lattice-edges (reading from)
-  "Return conversion edges beginning at FROM in READING."
-  (let ((remaining (- (length reading) from))
-        (size 1)
-        edges)
-    (while (<= size remaining)
-      (let* ((key (substring reading from (+ from size)))
-             (candidates (nelisp-ime--dictionary-candidates key)))
-        (when candidates
-          (push (list :from from :to (+ from size) :reading key
-                      :candidates candidates
-                      :surface (plist-get (car candidates) :surface)
-                      :cost (plist-get (car candidates) :cost))
-                edges)))
-      (setq size (1+ size)))
-    (when (> remaining 0)
-      (let ((kana (substring reading from (1+ from))))
-        (push (list :from from :to (1+ from) :reading kana
-                    :candidates (list (list :surface kana
-                                            :cost nelisp-ime-unknown-cost))
-                    :surface kana :cost nelisp-ime-unknown-cost)
-              edges)))
-    edges))
+;;; Sessions
 
-(defun nelisp-ime--segment-public (edge)
-  "Convert internal lattice EDGE to a public segment plist."
-  (list :from (plist-get edge :from)
-        :to (plist-get edge :to)
-        :reading (plist-get edge :reading)
-        :candidate (plist-get edge :surface)
-        :candidates (mapcar (lambda (item) (plist-get item :surface))
-                            (plist-get edge :candidates))))
+(defun nelisp-ime--check-session-id (session-id)
+  "Require SESSION-ID to be a non-empty string."
+  (unless (and (stringp session-id) (> (length session-id) 0))
+    (error "nelisp-ime: session id must be a non-empty string")))
 
-(defun nelisp-ime-lattice-convert (reading _context)
-  "Convert READING through a minimum-cost dictionary lattice."
-  (if (= (length reading) 0)
-      '(:preedit "" :candidates nil :segments nil)
-    (let* ((size (length reading))
-           (infinity nelisp-ime-infinity)
-           (costs (make-vector (1+ size) infinity))
-           (paths (make-vector (1+ size) nil)))
-      (aset costs 0 0)
-      (let ((position 0))
-        (while (< position size)
-          (unless (= (aref costs position) infinity)
-            (dolist (edge (nelisp-ime--lattice-edges reading position))
-              (let* ((to (plist-get edge :to))
-                     (cost (+ (aref costs position)
-                              (plist-get edge :cost))))
-                (when (< cost (aref costs to))
-                  (aset costs to cost)
-                  (aset paths to (append (aref paths position)
-                                         (list edge)))))))
-          (setq position (1+ position))))
-      (let* ((path (aref paths size))
-             (segments (mapcar #'nelisp-ime--segment-public path))
-             (preedit (mapconcat (lambda (edge)
-                                   (plist-get edge :surface))
-                                 path ""))
-             (first (car segments)))
-        (list :preedit preedit
-              :candidates (plist-get first :candidates)
-              :segments segments
-              :cost (aref costs size))))))
+(defun nelisp-ime--session (session-id)
+  "Return SESSION-ID state or signal an error when it is not open."
+  (or (gethash session-id nelisp-ime-sessions)
+      (error "nelisp-ime: unknown session %s" session-id)))
 
 (defun nelisp-ime--segment-preedit (segments)
   "Concatenate selected candidates from SEGMENTS."
@@ -360,7 +247,7 @@ expression candidates are ignored; plain candidates and annotations are safe."
   "Recompute live conversion fields in SESSION and return SESSION."
   (let* ((reading (plist-get session :reading))
          (context (plist-get session :context))
-         (conversion (funcall nelisp-ime-converter-function reading context)))
+         (conversion (nelisp-ime--convert session reading context)))
     (setq session (plist-put session :preedit
                              (or (plist-get conversion :preedit) reading)))
     (setq session (plist-put session :candidates
@@ -393,21 +280,30 @@ expression candidates are ignored; plain candidates and annotations are safe."
 (defun nelisp-ime-session-open (session-id &optional options)
   "Open or replace SESSION-ID using platform-neutral OPTIONS.
 
-OPTIONS may contain :input-style and :context.  Input-style is metadata for
-the platform adapter; physical key layout normalization stays outside core."
+OPTIONS may contain :input-style, :context, and :engine.  Input-style is
+metadata for the platform adapter; physical key layout normalization stays
+outside core.  :engine names a registered conversion engine for this
+session; omitting it defers to `nelisp-ime-converter-function' and then
+`nelisp-ime-default-engine'."
   (nelisp-ime--check-session-id session-id)
-  (let ((session (list :id session-id
-                       :input-style (or (plist-get options :input-style) 'kana)
-                       :context (plist-get options :context)
-                       :reading ""
-                       :pending ""
-                       :preedit ""
-                       :segments nil
-                       :candidates nil
-                       :active-segment 0
-                       :candidate-index 0)))
-    (puthash session-id session nelisp-ime-sessions)
-    (nelisp-ime--snapshot session)))
+  (let ((engine (plist-get options :engine)))
+    (when engine
+      (unless (nelisp-ime-engine-get engine)
+        (error "nelisp-ime: unknown engine %s" engine)))
+    (let ((session (list :id session-id
+                         :input-style (or (plist-get options :input-style)
+                                          'kana)
+                         :context (plist-get options :context)
+                         :engine engine
+                         :reading ""
+                         :pending ""
+                         :preedit ""
+                         :segments nil
+                         :candidates nil
+                         :active-segment 0
+                         :candidate-index 0)))
+      (puthash session-id session nelisp-ime-sessions)
+      (nelisp-ime--snapshot session))))
 
 ;;;###autoload
 (defun nelisp-ime-session-close (session-id)
@@ -517,9 +413,14 @@ the platform adapter; physical key layout normalization stays outside core."
         (empty (list :id session-id
                      :input-style (plist-get session :input-style)
                      :context (plist-get session :context)
+                     :engine (plist-get session :engine)
                      :reading "" :pending "" :preedit "" :segments nil
                      :candidates nil :active-segment 0 :candidate-index 0)))
-    (when commit-p (nelisp-ime--learn-segments (plist-get session :segments)))
+    (when commit-p
+      (let* ((engine (nelisp-ime--session-engine session))
+             (learn (and engine (plist-get engine :learn))))
+        (funcall (or learn #'nelisp-ime--learn-segments)
+                 (plist-get session :segments))))
     (puthash session-id empty nelisp-ime-sessions)
     (nelisp-ime--snapshot empty commit)))
 
@@ -529,10 +430,16 @@ the platform adapter; physical key layout normalization stays outside core."
 
 Supported operations are :key, :insert, :backspace, :select-segment,
 :select-candidate, :commit, and :cancel.  Platform adapters retain ownership
-of native key codes and UI."
+of native key codes and UI.
+
+An engine registered with a :feed hook receives every EVENT before the
+default composition pipeline and returns the snapshot itself."
   (let* ((session (nelisp-ime--session session-id))
+         (engine (nelisp-ime--session-engine session))
+         (feed (and engine (plist-get engine :feed)))
          (operation (plist-get event :op)))
     (cond
+     (feed (funcall feed session-id session event))
      ((eq operation :key)
       (nelisp-ime--key session-id session event))
      ((eq operation :insert)

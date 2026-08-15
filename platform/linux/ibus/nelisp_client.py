@@ -16,6 +16,7 @@ class NeLispClient:
         files = ("packages/nelisp-json/src/nelisp-json.el",
                  "packages/nelisp-ime/src/nelisp-ime-input.el",
                  "packages/nelisp-ime/src/nelisp-ime.el",
+                 "packages/nelisp-ime/src/nelisp-ime-lattice.el",
                  "packages/nelisp-ime/data/nelisp-ime-dictionary-data.el",
                  "packages/nelisp-ime/src/nelisp-ime-protocol.el")
         form = "(progn " + " ".join(

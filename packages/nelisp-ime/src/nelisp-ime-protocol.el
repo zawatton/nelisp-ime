@@ -12,6 +12,9 @@
 (require 'nelisp-json)
 (require 'nelisp-ime)
 
+(declare-function nelisp-ime-dictionary-load-skk "nelisp-ime-lattice"
+                  (file &optional coding expand-okuri))
+
 (defconst nelisp-ime-protocol-version 1)
 
 (defun nelisp-ime-protocol--object (&rest pairs)
@@ -55,20 +58,29 @@
         (error "nelisp-ime: unsupported protocol version %S" requested))
       (list :protocolVersion nelisp-ime-protocol-version
             :engine "nelisp-ime"
+            :engines (vconcat (mapcar #'symbol-name
+                                      (nelisp-ime-engine-names)))
             :capabilities ["kana" "romaji" "live-conversion" "learning"
-                           "multi-session"])))
+                           "multi-session" "engine-select"])))
    ((equal method "ime/health") (list :ok t))
    ((equal method "ime/dictionary.load")
+    ;; SKK dictionary loading belongs to the bundled lattice engine; keep
+    ;; the protocol loadable without it and fail with a clear message.
+    (unless (fboundp 'nelisp-ime-dictionary-load-skk)
+      (error "nelisp-ime: dictionary.load requires the lattice engine"))
     (list :entries
           (nelisp-ime-dictionary-load-skk
            (gethash "file" params)
            (and (equal (gethash "coding" params) "utf-8") 'utf-8))))
    ((equal method "ime/session.open")
-    (nelisp-ime-session-open
-     (gethash "sessionId" params)
-     (list :input-style
-           (nelisp-ime-protocol--input-style (gethash "inputStyle" params))
-           :context (gethash "context" params))))
+    (let ((engine (gethash "engine" params)))
+      (nelisp-ime-session-open
+       (gethash "sessionId" params)
+       (list :input-style
+             (nelisp-ime-protocol--input-style (gethash "inputStyle" params))
+             :context (gethash "context" params)
+             :engine (and (stringp engine) (> (length engine) 0)
+                          (intern engine))))))
    ((equal method "ime/session.close")
     (list :closed (nelisp-ime-session-close (gethash "sessionId" params))))
    ((equal method "ime/session.feed")
