@@ -446,9 +446,21 @@ Return (VALUE . NEXT-POS)."
      table)
     (nreverse entries)))
 
+(defconst nelisp-json--escape-probe-regexp
+  (concat "[" (string 0) "-" (string 31) "\"\\]")
+  "Matches any character that requires escaping in a JSON string.")
+
 (defun nelisp-json--encode-string-contents (string)
   "Return escaped JSON string contents for STRING without quotes."
-  (let ((chunks nil)
+  ;; Escaping is what makes encoding cost scale with the number of
+  ;; CHARACTERS rather than the number of values: the loop below touches
+  ;; every character, and interpreted element operations cost ~140us each
+  ;; on the standalone runtime.  Almost no real string needs escaping --
+  ;; Japanese text and identifiers never do -- so probe once with a regex
+  ;; and hand the string straight back when nothing has to change.
+  (if (not (string-match nelisp-json--escape-probe-regexp string))
+      string
+    (let ((chunks nil)
         (start 0)
         (len (length string))
         ch)
@@ -473,13 +485,34 @@ Return (VALUE . NEXT-POS)."
         (setq start (1+ idx))))
     (when (< start len)
       (push (substring string start len) chunks))
-    (apply #'concat (nreverse chunks))))
+    (apply #'concat (nreverse chunks)))))
+
+(defvar nelisp-json-encode-string-cache (make-hash-table :test 'equal)
+  "Quoted JSON forms keyed by the string they encode.
+
+Deciding whether a string needs escaping means inspecting every character,
+and on the standalone runtime an interpreted element operation costs
+~140us -- scanning dominated encoding by 4x in measurement.  The same
+strings recur constantly (dictionary candidates repeat on every keystroke),
+so the finished quoted form is memoized instead.")
+
+(defvar nelisp-json-encode-string-cache-limit 4096
+  "Entry count above which `nelisp-json-encode-string-cache' is cleared.
+A plain clear keeps the bound honest without paying for eviction order.")
 
 (defun nelisp-json-encode-string (string)
   "Return STRING encoded as a quoted JSON string."
   (unless (stringp string)
     (signal 'wrong-type-argument (list 'stringp string)))
-  (concat "\"" (nelisp-json--encode-string-contents string) "\""))
+  (let ((cached (gethash string nelisp-json-encode-string-cache)))
+    (or cached
+        (let ((encoded (concat "\"" (nelisp-json--encode-string-contents string)
+                               "\"")))
+          (when (> (hash-table-count nelisp-json-encode-string-cache)
+                   nelisp-json-encode-string-cache-limit)
+            (clrhash nelisp-json-encode-string-cache))
+          (puthash string encoded nelisp-json-encode-string-cache)
+          encoded))))
 
 (defun nelisp-json--encode-number (number)
   "Return NUMBER rendered as a JSON number."
@@ -501,28 +534,25 @@ Return (VALUE . NEXT-POS)."
 
 (defun nelisp-json--encode-array (items)
   "Return JSON array string for list ITEMS."
-  (let ((out "[")
-        (first t)
+  ;; Collect the pieces and join once.  Growing one string per element copies
+  ;; the whole accumulator each time, which is O(total-characters^2) -- the
+  ;; dominant cost of encoding a snapshot on the standalone runtime.
+  (let ((chunks nil)
         (cur items))
     (while cur
-      (unless first
-        (setq out (concat out ",")))
-      (setq out (concat out (nelisp-json-encode (car cur))))
-      (setq first nil)
+      (push (nelisp-json-encode (car cur)) chunks)
       (setq cur (cdr cur)))
-    (concat out "]")))
+    (concat "[" (nelisp-json--join-with-comma (nreverse chunks)) "]")))
 
 (defun nelisp-json--encode-vector (items)
   "Return JSON array string for vector ITEMS without list conversion."
-  (let ((out "[")
+  (let ((chunks nil)
         (i 0)
         (n (length items)))
     (while (< i n)
-      (when (> i 0)
-        (setq out (concat out ",")))
-      (setq out (concat out (nelisp-json-encode (aref items i))))
+      (push (nelisp-json-encode (aref items i)) chunks)
       (setq i (1+ i)))
-    (concat out "]")))
+    (concat "[" (nelisp-json--join-with-comma (nreverse chunks)) "]")))
 
 (defun nelisp-json--encode-object-entry (key value)
   "Return one JSON object member for KEY and VALUE."
@@ -533,47 +563,32 @@ Return (VALUE . NEXT-POS)."
 
 (defun nelisp-json--encode-object-pairs (pairs)
   "Return JSON object string for PAIRS."
-  (let ((out "{")
-        (first t)
+  (let ((chunks nil)
         (cur pairs))
     (while cur
-      (unless first
-        (setq out (concat out ",")))
-      (setq out (concat out
-                        (nelisp-json--encode-object-entry
-                         (car (car cur)) (cdr (car cur)))))
-      (setq first nil)
+      (push (nelisp-json--encode-object-entry
+             (car (car cur)) (cdr (car cur)))
+            chunks)
       (setq cur (cdr cur)))
-    (concat out "}")))
+    (concat "{" (nelisp-json--join-with-comma (nreverse chunks)) "}")))
 
 (defun nelisp-json--encode-plist-object (plist)
   "Return JSON object string for PLIST without allocating pair cells."
-  (let ((out "{")
-        (first t)
+  (let ((chunks nil)
         (cur plist))
     (while cur
-      (unless first
-        (setq out (concat out ",")))
-      (setq out (concat out
-                        (nelisp-json--encode-object-entry
-                         (car cur) (cadr cur))))
-      (setq first nil)
+      (push (nelisp-json--encode-object-entry (car cur) (cadr cur)) chunks)
       (setq cur (cddr cur)))
-    (concat out "}")))
+    (concat "{" (nelisp-json--join-with-comma (nreverse chunks)) "}")))
 
 (defun nelisp-json--encode-hash-object (table)
   "Return JSON object string for hash TABLE without materializing entries."
-  (let ((out "{")
-        (first t))
+  (let ((chunks nil))
     (maphash
      (lambda (key value)
-       (unless first
-         (setq out (concat out ",")))
-       (setq out (concat out
-                         (nelisp-json--encode-object-entry key value)))
-       (setq first nil))
+       (push (nelisp-json--encode-object-entry key value) chunks))
      table)
-    (concat out "}")))
+    (concat "{" (nelisp-json--join-with-comma (nreverse chunks)) "}")))
 
 (defun nelisp-json--value->object-pairs (value)
   "Return VALUE as a list of (KEY . VALUE) pairs if it is an object.
