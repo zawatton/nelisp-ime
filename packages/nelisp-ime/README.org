@@ -34,7 +34,7 @@ Framework core (=nelisp-ime.el=):
 - =nelisp-ime-learning-import= / =nelisp-ime-learning-export=
 - =nelisp-ime-protocol-handle-json=
 
-Bundled lattice engine (=nelisp-ime-lattice.el=):
+Bundled lattice engine (=packages/nelisp-ime-lattice=, git submodule):
 
 - =nelisp-ime-lattice-convert=
 - =nelisp-ime-dictionary-install= / =nelisp-ime-dictionary-load-skk=
@@ -63,8 +63,10 @@ InputMethodKit / Fcitx 5 or IBus / TSF
 #+end_example
 
 The generated dictionary file is used by standalone NeLisp because raw SKK
-files require encoding and editor-buffer facilities.  See =data/README.md= for
-regeneration and larger-dictionary substitution.
+files require encoding and editor-buffer facilities.  See the
+[[https://github.com/zawatton/nelisp-ime-lattice][nelisp-ime-lattice]] repository
+(vendored at =packages/nelisp-ime-lattice=) for regeneration and
+larger-dictionary substitution.
 
 * Conversion engines
 
@@ -93,15 +95,15 @@ adapters are engine-agnostic.  Conversion itself is pluggable:
 
 Bundled engines:
 
-| Name         | File                   | Behavior                                    |
-|--------------+------------------------+---------------------------------------------|
-| =lattice=    | =nelisp-ime-lattice.el= | Minimum-cost dictionary lattice + SKK loader |
-| =dictionary= | =nelisp-ime.el=         | Exact-reading alist lookup (reference)       |
+| Name         | Source                                             | Behavior                                     |
+|--------------+----------------------------------------------------+----------------------------------------------|
+| =lattice=    | [[https://github.com/zawatton/nelisp-ime-lattice][nelisp-ime-lattice]] (submodule) | Minimum-cost dictionary lattice + SKK loader |
+| =dictionary= | =nelisp-ime.el=                                    | Exact-reading alist lookup (reference)       |
 
-The lattice engine (and its SKK dictionary tooling and generated data) is
-scheduled to move to its own repository; this package then keeps only the
-framework plus the tiny reference engine, and IMEs such as an SKK-style modal
-engine plug in as separate packages.
+The lattice engine lives in its own repository and is vendored here as the
+git submodule =packages/nelisp-ime-lattice= (clone with =--recursive= or run
+=git submodule update --init=).  IMEs such as an SKK-style modal engine plug
+in the same way as separate packages.
 
 * Validation
 

@@ -1,0 +1,3 @@
+[submodule "packages/nelisp-ime-lattice"]
+	path = packages/nelisp-ime-lattice
+	url = https://github.com/zawatton/nelisp-ime-lattice.git

@@ -22,7 +22,7 @@
 (ert-deftest nelisp-ime-protocol-test-session-round-trip ()
   (let ((nelisp-ime-sessions (make-hash-table :test 'equal))
         (nelisp-ime-dictionary '(("かな" "仮名")))
-        (nelisp-ime-converter-function #'nelisp-ime-lattice-convert))
+        (nelisp-ime-converter-function #'nelisp-ime-dictionary-convert))
     (let ((open (nelisp-ime-protocol--object
                  "sessionId" "mac:1" "inputStyle" "kana")))
       (nelisp-ime-protocol-handle-json
@@ -68,7 +68,7 @@
 (ert-deftest nelisp-ime-protocol-test-candidates-are-json-arrays ()
   (let ((nelisp-ime-sessions (make-hash-table :test 'equal))
         (nelisp-ime-dictionary '(("はし" "橋" "箸" "端" "嘴")))
-        (nelisp-ime-converter-function #'nelisp-ime-lattice-convert))
+        (nelisp-ime-converter-function #'nelisp-ime-dictionary-convert))
     (nelisp-ime-session-open "array")
     (let* ((event (nelisp-ime-protocol--object "op" "insert" "text" "はし"))
            (params (nelisp-ime-protocol--object

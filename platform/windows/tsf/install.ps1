@@ -16,12 +16,14 @@ $Root = Join-Path $Destination "nelisp-root"
 New-Item -ItemType Directory -Force -Path $Bin | Out-Null
 New-Item -ItemType Directory -Force -Path "$Root\packages\nelisp-json\src" | Out-Null
 New-Item -ItemType Directory -Force -Path "$Root\packages\nelisp-ime\src" | Out-Null
-New-Item -ItemType Directory -Force -Path "$Root\packages\nelisp-ime\data" | Out-Null
+New-Item -ItemType Directory -Force -Path "$Root\packages\nelisp-ime-lattice\src" | Out-Null
+New-Item -ItemType Directory -Force -Path "$Root\packages\nelisp-ime-lattice\data" | Out-Null
 Copy-Item $Runtime "$Bin\nelisp.exe" -Force
 Copy-Item $Dll "$Bin\nelisp-ime-tsf.dll" -Force
 Copy-Item "$Repo\packages\nelisp-json\src\nelisp-json.el" "$Root\packages\nelisp-json\src" -Force
 Copy-Item "$Repo\packages\nelisp-ime\src\*.el" "$Root\packages\nelisp-ime\src" -Force
-Copy-Item "$Repo\packages\nelisp-ime\data\nelisp-ime-dictionary-data.el" "$Root\packages\nelisp-ime\data" -Force
+Copy-Item "$Repo\packages\nelisp-ime-lattice\src\nelisp-ime-lattice.el" "$Root\packages\nelisp-ime-lattice\src" -Force
+Copy-Item "$Repo\packages\nelisp-ime-lattice\data\nelisp-ime-dictionary-data.el" "$Root\packages\nelisp-ime-lattice\data" -Force
 # Precompile every staged .el to an adjacent .nelc so the resident engine's
 # bootstrap loads the compiled artifact instead of re-reading source.  Without
 # this the first TSF Activate blocks for minutes on the bare source reader.

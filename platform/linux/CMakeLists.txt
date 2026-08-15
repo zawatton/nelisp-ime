@@ -19,9 +19,11 @@ install(FILES
 install(FILES
   "${NELISP_IME_REPO_ROOT}/packages/nelisp-ime/src/nelisp-ime-input.el"
   "${NELISP_IME_REPO_ROOT}/packages/nelisp-ime/src/nelisp-ime.el"
-  "${NELISP_IME_REPO_ROOT}/packages/nelisp-ime/src/nelisp-ime-lattice.el"
   "${NELISP_IME_REPO_ROOT}/packages/nelisp-ime/src/nelisp-ime-protocol.el"
   DESTINATION share/nelisp-ime/nelisp-root/packages/nelisp-ime/src)
 install(FILES
-  "${NELISP_IME_REPO_ROOT}/packages/nelisp-ime/data/nelisp-ime-dictionary-data.el"
-  DESTINATION share/nelisp-ime/nelisp-root/packages/nelisp-ime/data)
+  "${NELISP_IME_REPO_ROOT}/packages/nelisp-ime-lattice/src/nelisp-ime-lattice.el"
+  DESTINATION share/nelisp-ime/nelisp-root/packages/nelisp-ime-lattice/src)
+install(FILES
+  "${NELISP_IME_REPO_ROOT}/packages/nelisp-ime-lattice/data/nelisp-ime-dictionary-data.el"
+  DESTINATION share/nelisp-ime/nelisp-root/packages/nelisp-ime-lattice/data)

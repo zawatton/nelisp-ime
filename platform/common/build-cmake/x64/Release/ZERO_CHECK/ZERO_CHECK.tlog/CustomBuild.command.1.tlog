@@ -1,0 +1,10 @@
+^C:\USERS\KUROZ\COWORK\NOTES\DEV\NELISP-IME\PLATFORM\COMMON\BUILD-CMAKE\CMAKEFILES\A36209076F746B1FEAA5644655EE98B8\GENERATE.STAMP.RULE
+setlocal
+C:\msys64\mingw64\bin\cmake.exe -SC:/Users/kuroz/Cowork/Notes/dev/nelisp-ime/platform/common -BC:/Users/kuroz/Cowork/Notes/dev/nelisp-ime/platform/common/build-cmake --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/kuroz/Cowork/Notes/dev/nelisp-ime/platform/common/build-cmake/nelisp-ime-common-smoke.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

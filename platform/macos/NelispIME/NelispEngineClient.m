@@ -83,8 +83,8 @@
   [self.readBuffer setLength:0];
   NSArray<NSString *> *files = @[@"packages/nelisp-json/src/nelisp-json.el",
     @"packages/nelisp-ime/src/nelisp-ime-input.el", @"packages/nelisp-ime/src/nelisp-ime.el",
-    @"packages/nelisp-ime/src/nelisp-ime-lattice.el",
-    @"packages/nelisp-ime/data/nelisp-ime-dictionary-data.el",
+    @"packages/nelisp-ime-lattice/src/nelisp-ime-lattice.el",
+    @"packages/nelisp-ime-lattice/data/nelisp-ime-dictionary-data.el",
     @"packages/nelisp-ime/src/nelisp-ime-protocol.el"];
   NSMutableString *bootstrap = [NSMutableString stringWithString:@"(progn "];
   for (NSString *file in files)
