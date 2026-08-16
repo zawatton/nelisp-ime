@@ -79,6 +79,21 @@ telling the adapter to pass the key through to the application.  Bind
 The protocol exposes the same surface: =ime/session.status=,
 =ime/session.reset=, =ime/maintenance=, and =ime/learning.compact=.
 
+* Wire protocols
+
+Two boundaries are available, and an adapter picks one:
+
+- =nelisp-ime-protocol= -- line-delimited JSON-RPC.  Self-describing and
+  cross-platform; used by the macOS and Linux adapters.
+- =nelisp-ime-stateline= -- the single-line STATE protocol that the
+  [[https://github.com/zawatton/nelisp-skk-ime][nelisp-skk-ime]] Windows stack
+  already runs in production.  Speaking it byte for byte lets that stack's
+  C++ host and TSF text service drive this framework unmodified, and lets it
+  switch engines over the wire with its existing =ENGINE= verbs.
+
+Windows support comes from that stack rather than from an adapter in this
+repository; see =platform/README.md=.
+
 * Architecture
 
 #+begin_example

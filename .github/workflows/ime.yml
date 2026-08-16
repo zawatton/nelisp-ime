@@ -74,19 +74,11 @@ jobs:
       - name: Build Windows NeLisp
         shell: bash
         run: NELISP_STANDALONE_TARGET=windows-x86_64 make standalone-reader
-      - name: Build TSF DLL and common smoke
+      - name: Build common client and run its smoke
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cmake -S platform/windows/tsf -B platform/windows/tsf/build -A x64
-          cmake --build platform/windows/tsf/build --config Release
-          platform/windows/tsf/build/Release/nelisp-ime-tsf-smoke.exe platform/windows/tsf/build/Release/nelisp-ime-tsf.dll
-          & "$env:SystemRoot\System32\regsvr32.exe" /s platform/windows/tsf/build/Release/nelisp-ime-tsf.dll
-          if ($LASTEXITCODE -ne 0) { throw "TSF registration failed" }
-          & "$env:SystemRoot\System32\regsvr32.exe" /s /u platform/windows/tsf/build/Release/nelisp-ime-tsf.dll
           cmake -S platform/common -B platform/common/build-cmake -A x64
           cmake --build platform/common/build-cmake --config Release
           platform/common/build-cmake/Release/nelisp-ime-common-smoke.exe target/nelisp.exe $PWD platform/common/build-cmake/learning.json
-          & platform/windows/tsf/install.ps1 -BuildDirectory platform/windows/tsf/build -Destination "$env:RUNNER_TEMP\NeLispIME" -NoRegister
-          if (-not (Test-Path "$env:RUNNER_TEMP\NeLispIME\bin\nelisp-ime-tsf.dll")) { throw "TSF staging failed" }
