@@ -160,14 +160,27 @@ in the same way as separate packages.
 * Validation
 
 #+begin_src sh
-make test-one FILE="packages/nelisp-ime/test/nelisp-ime-test.el packages/nelisp-ime/test/nelisp-ime-protocol-test.el"
+make test-one FILE="packages/nelisp-ime/test/nelisp-ime-test.el packages/nelisp-ime/test/nelisp-ime-protocol-test.el packages/nelisp-ime/test/nelisp-ime-stateline-test.el"
 make -C platform/macos smoke
 make -C platform/common smoke
 make -C platform/linux/ibus smoke
 #+end_src
 
+On Windows, build the engine runtime with the target passed as a make
+variable -- an environment prefix does not reach MSYS2 make from Git Bash,
+and the Makefile then silently builds the linux-x86_64 default -- and drive
+the common client's smoke against it from PowerShell:
+
+#+begin_src sh
+make standalone-reader NELISP_STANDALONE_TARGET=windows-x86_64
+cmake -S platform/common -B platform/common/build-cmake -A x64
+cmake --build platform/common/build-cmake --config Release
+platform/common/build-cmake/Release/nelisp-ime-common-smoke.exe target/nelisp.exe $PWD platform/common/build-cmake/learning.json
+#+end_src
+
 The repository also contains a dedicated four-job GitHub Actions workflow for
-the core, macOS InputMethodKit, Linux Fcitx 5/IBus, and Windows TSF builds.
+the core, macOS InputMethodKit, Linux Fcitx 5/IBus, and Windows common-client
+builds.
 
 * References
 
