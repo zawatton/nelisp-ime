@@ -436,18 +436,27 @@ and NeLisp-only defuns see (KEY VALUE) — not the raw host callee."
 
 (ert-deftest nelisp-stdlib-printer-avoids-reverse-list-buffer ()
   "`prin1-to-string' printer helpers should not allocate reversed parts lists."
-  (let* ((symbols '(nelisp--prn-string-escaped
-                    nelisp--prn-chunks-add
-                    nelisp--prn-chunks-string
-                    nelisp--prn-float
-                    nelisp--prn-reader-macro-abbrev
-                    nelisp--prn-list-body
-                    nelisp--prn-vector
-                    nelisp--prn-record
-                    nelisp--prn-to-string
-                    prin1-to-string
-                    prin1
-                    terpri))
+  (let* ((printer-forms
+          (with-temp-buffer
+            (insert-file-contents
+             (expand-file-name "lisp/nelisp-stdlib-prn.el"
+                               default-directory))
+            (goto-char (point-min))
+            (let ((done nil)
+                  forms)
+              (while (not done)
+                (condition-case nil
+                    (let ((form (read (current-buffer))))
+                      (when (and (consp form)
+                                 (eq (car form) 'defun)
+                                 (string-prefix-p "nelisp--prn-"
+                                                  (symbol-name (cadr form))))
+                        (push form forms)))
+                  (end-of-file
+                   (setq done t))))
+              (nreverse forms))))
+         (symbols (append (mapcar #'cadr printer-forms)
+                          '(prin1-to-string prin1 terpri)))
          (saved (mapcar (lambda (sym)
                           (cons sym
                                 (and (fboundp sym)
@@ -458,30 +467,8 @@ and NeLisp-only defuns see (KEY VALUE) — not the raw host callee."
          got)
     (unwind-protect
         (progn
-          (with-temp-buffer
-            (insert-file-contents
-             (expand-file-name "lisp/nelisp-stdlib-prn.el"
-                               default-directory))
-            (goto-char (point-min))
-            (let ((done nil))
-              (while (not done)
-                (condition-case nil
-                    (let ((form (read (current-buffer))))
-                      (when (and (consp form)
-                                 (eq (car form) 'defun)
-                                 (memq (cadr form)
-                                       '(nelisp--prn-string-escaped
-                                         nelisp--prn-chunks-add
-                                         nelisp--prn-chunks-string
-                                         nelisp--prn-float
-                                         nelisp--prn-reader-macro-abbrev
-                                         nelisp--prn-list-body
-                                         nelisp--prn-vector
-                                         nelisp--prn-record
-                                         nelisp--prn-to-string)))
-                        (eval form t)))
-                  (end-of-file
-                   (setq done t))))))
+          (dolist (form printer-forms)
+            (eval form t))
           (cl-letf (((symbol-function 'nreverse)
                      (lambda (&rest args)
                        (setq nreverse-calls (1+ nreverse-calls))
@@ -493,7 +480,13 @@ and NeLisp-only defuns see (KEY VALUE) — not the raw host callee."
                    (nelisp--prn-vector [1 "x"] t)
                    (nelisp--prn-to-string '(quote abc) t))))
           (should (equal got
-                         '("a\\\"b\\\\c\\n"
+                         ;; A newline passes through VERBATIM: Emacs `prin1'
+                         ;; escapes only `"' and `\\', measured on 30.1.  This
+                         ;; expected "a\\\"b\\\\c\\n", which is what the printer
+                         ;; produced before it was brought in line -- and the
+                         ;; test asserting the old behaviour is how the change
+                         ;; announced itself.
+                         '("a\\\"b\\\\c\n"
                            "1 \"x\" . y"
                            "[1 \"x\"]"
                            "'abc")))
@@ -643,6 +636,7 @@ resolvable and completes without error returning nil."
 timer and immediately cancel it via host `cancel-timer' (called
 from ERT, not NeLisp) to avoid leaking a real timer into the test
 suite."
+  (skip-unless (fboundp 'alloc-bytes))
   (let ((timer (nelisp-eval
                 '(run-at-time 3600 nil (lambda () (ignore))))))
     (should (timerp timer))

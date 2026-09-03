@@ -1,0 +1,188 @@
+#+TITLE: nelisp-pkg — package manifests checked against the real graph
+
+* Summary
+
+NeLisp has packages but no package system.  =packages/<name>/= is a
+layout convention, the Makefile puts every =src= directory on the load
+path, and =require= finds whatever is there.  That holds until two
+questions need answering — *what does this package depend on*, and *in
+what order may these be loaded* — and today both are answered by trying
+it.
+
+=nelisp-pkg= derives the answer from the code, lets a package declare
+it, and checks the declaration against the derivation.
+
+* Why derive before declaring
+
+A manifest format adopted before the graph is known would be 34 files of
+guesses.  Worse, a package system whose metadata is unverified is one
+that lies, which is more expensive than having none, because it is
+believed.  So the derivation is the source of truth about what the code
+does, the manifest is a statement of intent, and the output that matters
+is where the two disagree.
+
+* Public API
+
+- =nelisp-pkg-scan= — derive every package's provides / requires
+- =nelisp-pkg-edges= — cross-package dependency edges
+- =nelisp-pkg-resolve= — load order, or the cycle that prevents one
+- =nelisp-pkg-check= — findings (see below)
+- =nelisp-pkg-validate-manifest= / =nelisp-pkg-read-manifest=
+- =nelisp-pkg-report= / =nelisp-pkg-summary= / =nelisp-pkg-findings-of-kind=
+
+* Manifest
+
+=packages/<name>/manifest.el=, one plist:
+
+#+begin_src elisp
+(:name "nelisp-http"
+ :requires ("nelisp-process" "nelisp-state" "nelisp-sys"))
+#+end_src
+
+=:requires= names *packages*, not features.  Host libraries (=cl-lib=,
+=dom=, =url=) are not listed: they are not in the tree, so the checker
+classifies them separately rather than pretending they are edges.
+
+=:name= and =:requires= are required.  *=:version= is not* — nothing
+consumes a version yet (no resolver constraint, no distribution, no
+compatibility rule), so requiring one would mean stamping 34 invented
+numbers into the tree and calling it metadata.  A =:version= is
+validated as a string when a package chooses to carry one, and is
+preserved across regeneration, along with any other key an author adds.
+
+** Writing them
+
+#+begin_src sh
+make pkg-manifest-update            # every package
+make pkg-manifest-update PKG=nl-safe
+#+end_src
+
+Writes each manifest from the dependencies the code actually has.  This
+is the one-command fix for a drift finding, which is what makes the
+gate affordable: a declaration people must maintain by hand goes stale,
+and a gate that then blocks them is friction they route around.
+
+Regeneration is idempotent and preserves every key except =:requires=.
+It does not preserve comments — the file is generated, so put the
+reasoning in the package README rather than in the manifest.
+
+* Findings
+
+| kind                        | meaning                                     |
+|-----------------------------+---------------------------------------------|
+| =pkg-cycle=                 | packages that require each other in a ring  |
+| =pkg-undeclared-dependency= | the code requires it, the manifest does not |
+| =pkg-stale-dependency=      | the manifest requires it, the code does not |
+| =pkg-missing-manifest=      | no =manifest.el= (informational for now)    |
+| =pkg-invalid-manifest=      | =manifest.el= unreadable or malformed       |
+| =pkg-unresolved-require=    | feature provided nowhere in the tree        |
+
+* Gate
+
+#+begin_src sh
+make pkg-graph
+tools/ai/nelisp-ai.sh gate pkg-graph -- make pkg-graph
+#+end_src
+
+Four findings fail the build:
+
+- =pkg-cycle= — a ring of requires has no load order at all, and no care
+  at the call site can work around it;
+- =pkg-invalid-manifest= — a manifest that cannot be read is worse than
+  one that is absent, because it is believed;
+- =pkg-undeclared-dependency= — the code depends on a package the
+  manifest does not name;
+- =pkg-stale-dependency= — the manifest names one the code no longer
+  uses.
+
+The last two became gateable on 2026-08-18, when every package got a
+manifest.  They are the point of having manifests at all: unchecked, a
+declaration is decoration.  Both are fixed by =make pkg-manifest-update=,
+so the gate costs a keystroke.
+
+=pkg-missing-manifest= and =pkg-unresolved-require= are reported and not
+gated: the first cannot fire today, and the second is mostly host
+libraries, which would make the check red from birth.
+
+* What the tree looks like today (2026-08-17)
+
+#+begin_example
+34 packages, 20 cross-package edges, no cycles
+34 manifests, all matching the code
+13 requires provided nowhere in the tree:
+  compile dom flymake generator subr-x url url-http url-parse
+#+end_example
+
+The load order exists, which is the useful part: the graph is acyclic
+today, and this gate is what keeps it that way.
+
+* Load sequences
+
+On the standalone runtime, dependencies are loaded by explicit path
+rather than through =require=, and every smoke and recipe that does so
+carries a hand-written list in a hand-worked-out order.  Add a
+dependency and each of those lists is silently wrong until someone runs
+it — silently, because =(load "missing.el" nil t)= *returns t* in that
+runtime instead of signalling.
+
+#+begin_src sh
+make -s pkg-load-order PKG=nl-contract
+#+end_src
+
+#+begin_example
+packages/nelisp-json/src/nelisp-json.el
+packages/nl-prelude/src/nl-prelude.el
+packages/nl-safe/src/nl-safe.el
+packages/nl-safe/src/nl-resource.el
+packages/nl-safe/src/nl-safe-report.el
+packages/nl-contract/src/nl-contract.el
+packages/nl-contract/src/nl-contract-nelisp-json.el
+#+end_example
+
+Dependencies first, then each package's own files ordered so that a
+file follows what it provides for.  Verified end to end: that sequence
+loads in the standalone binary with =nelisp-json=, =nl-prelude=,
+=nl-safe= and =nl-contract= all present afterwards.
+
+The generated order for =nl-safe= matches the one hand-written in
+=packages/nl-safe/test/nl-safe-standalone-smoke.el=, and adds
+=nl-resource.el=, which that smoke does not need.
+
+A file whose intra-package requires cannot be satisfied is kept, at the
+end, rather than dropped: a load list that silently omits a file is
+worse than one in a doubtful order, because the failure moves somewhere
+else.
+
+* Checking the lists that already exist
+
+The eight standalone smokes cannot simply switch to a generated list —
+generating one inside the standalone runtime would mean bootstrapping
+this library there first — so their hand-written lists are checked
+instead:
+
+#+begin_src sh
+make pkg-load-lists
+#+end_src
+
+#+begin_example
+   5  packages/nl-check/test/nl-check-standalone-smoke.el
+   ...
+pkg-load-lists: 9 file(s), 33 load(s) checked
+#+end_example
+
+Two findings fail, and both are silent at run time:
+
+- =load-list-missing-file= — the path does not exist, so the load does
+  nothing and nothing it should define is defined;
+- =load-list-out-of-order= — an earlier file requires a feature a later
+  one provides.
+
+Pairs are compared by *actual dependency*, not by position in a derived
+order, so two unrelated files in either order are not a finding — a
+check that invents findings gets switched off.  A computed path is
+counted and reported rather than skipped, so a partly unreadable list
+cannot look fully checked.
+
+* Dependencies
+
+- Host: =cl-lib=, =subr-x=.  No NeLisp packages.

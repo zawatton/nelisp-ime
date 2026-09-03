@@ -1,0 +1,218 @@
+#+TITLE: nl-prelude — Result/Option error handling for NeLisp
+
+* Motivation
+
+Doc 168/169 Phase 1.  Elisp error handling is not value-based: =signal=
+unwinds the stack and =nil= conflates "no value" with "false" and
+"empty".  =nl-prelude= brings Rust-style =Result= / =Option= values and
+the =nl-?= early-return operator to Elisp code running on NeLisp (or on
+host Emacs — the package is pure Lisp and runtime-neutral).
+
+This is an *opt-in* extension library (Doc 168 section 2): loading it
+changes nothing about plain Elisp semantics, and code that does not
+=require= it is unaffected.
+
+* Representation
+
+Tagged conses compared with =eq= on interned tag symbols
+(Doc 169 section 2.1):
+
+#+begin_src elisp
+;; Result: (nl--ok . VALUE) / (nl--err . ERROR)
+;; Option: (nl--some . VALUE) / nl--none
+#+end_src
+
+The tags are internal; always go through the public constructors and
+predicates.
+
+* API
+
+#+begin_src elisp
+;; Construction
+(nl-ok VALUE)  (nl-err ERROR)  (nl-some VALUE)  nl-none
+
+;; Predicates
+(nl-ok-p X) (nl-err-p X) (nl-result-p X)
+(nl-some-p X) (nl-none-p X) (nl-option-p X)
+
+;; Extraction (generic over Result and Option)
+(nl-unwrap R)                  ; err/none -> signal nl-unwrap-error
+(nl-unwrap-or R DEFAULT)
+(nl-unwrap-or-else R FN)       ; err -> (FN payload), none -> (FN)
+
+;; Transform
+(nl-map R FN)                  ; ok/some mapped, err/none pass through
+(nl-map-err R FN)              ; Result only
+(nl-and-then R FN)             ; monadic bind, FN returns Result/Option
+(nl-ok->option R)  (nl-option->ok O ERROR)
+
+;; Aggregation
+(nl-collect LIST-OF-RESULTS)   ; all ok -> (nl-ok LIST), first err short-circuits
+
+;; Early return
+(nl-defun NAME ARGLIST BODY...)
+(nl-lambda ARGLIST BODY...)
+(nl-let* BINDINGS BODY...)     ; plain let* alias, marks nl-? pipelines
+(nl-? RESULT-FORM)             ; ok -> unwrapped value, err -> return it
+#+end_src
+
+Example (Doc 169 section 2.3):
+
+#+begin_src elisp
+(nl-defun read-config (path)
+  (nl-let* ((text (nl-? (nl-read-file path)))
+            (data (nl-? (nl-parse-json text))))
+    (nl-ok data)))
+#+end_src
+
+* v0.2 — ADT, auto-gensym, tail loop (Doc 169 Phase 2a)
+
+** =nl-defdata= / =nl-match=
+
+#+begin_src elisp
+(nl-defdata shape
+  (circle radius)
+  (rect width height)
+  (dot))
+
+(nl-match s
+  ((circle r)  (* float-pi r r))
+  ((rect w h)  (* w h))
+  ((dot)       0))
+#+end_src
+
+- =nl-defdata= generates constructors (=circle=), predicates
+  (=circle-p=, =shape-p=), and accessors (=circle-radius=), and
+  registers the closed variant set.  Values are vectors
+  =[nl--data TYPE VARIANT FIELD...]=.
+- =nl-match= checks *at expansion time* that every registered variant
+  is covered (missing variants stop the compile) and that pattern
+  arity matches the declaration.  A =_= clause skips the
+  exhaustiveness check; clauses after =_= and duplicate variant
+  clauses draw an unreachable warning.
+- Unregistered variant heads fall back to an unchecked runtime
+  dispatch — or are an expansion error under =(nl-strict t)=.
+- A value no clause matches signals =nl-match-error= at runtime.
+- Pattern variables starting with =_= are not bound.
+
+** =nl-defmacro= auto-gensym
+
+Symbols spelled with a trailing =#= in the produced expansion become
+gensyms, unique per expansion, consistent within one expansion:
+
+#+begin_src elisp
+(nl-defmacro my-unless (test &rest body)
+  `(let ((result\# (not ,test)))
+     (when result\# ,@body)))
+#+end_src
+
+*Reader note*: the host Emacs reader rejects a bare trailing =#=
+(=result#= is read as =result= + syntax error), so source that must
+load on host Emacs writes =result\#=.  The NeLisp standalone reader
+accepts both spellings.  The mechanism keys on the symbol *name*
+ending in =#=, so both spellings behave identically.
+
+This shields let-bound helper variables from capture.  It is *not*
+syntax-case: free-variable and function-position capture are not
+prevented.
+
+** =nl-loop= / =nl-recur=
+
+#+begin_src elisp
+(nl-loop ((acc 0) (n 100))
+  (if (zerop n)
+      acc
+    (nl-recur (+ acc n) (1- n))))  ; => 5050, constant stack
+#+end_src
+
+- Expands to =while= + simultaneous rebinding; 100k+ iterations are
+  fine.
+- =nl-recur= outside tail position (analyzed through =progn= / =if= /
+  =cond= / =when= / =unless= / =let= / =let*= / =and= / =or=) is an
+  expansion-time error, as are arity mismatches.
+- A nested =nl-loop= owns its own =nl-recur=.
+
+** =nl-trampoline= / =nl-bounce= (Doc 198 Phase 2)
+
+For mutually recursive functions, return an explicit bounce instead of
+making the recursive call directly, then enter the cycle through
+=nl-trampoline=:
+
+#+begin_src elisp
+(defun even-bounce-p (n)
+  (if (zerop n) t (nl-bounce #'odd-bounce-p (1- n))))
+
+(defun odd-bounce-p (n)
+  (if (zerop n) nil (nl-bounce #'even-bounce-p (1- n))))
+
+(nl-trampoline #'even-bounce-p 1000000) ; => t, constant stack
+#+end_src
+
+A bounce is =(nl--bounce TARGET ARGS)=, a tagged sentinel that the
+driver checks and dispatches.  Unlike =nl-loop=/=nl-recur='s cost-zero
+compile-time rewrite, each bounce allocates its request and pays one
+dispatch plus =apply=.  Only explicitly rewritten =nl-bounce= hops are
+stack-safe; a direct recursive call still grows the stack, and calling a
+bounce-producing function without =nl-trampoline= returns the raw
+sentinel.
+
+** =nl-strict=
+
+=(nl-strict t)= as a *top-level* form tightens expansion-time checks
+for the rest of the load/compile unit (currently: unregistered
+=nl-match= heads become errors).  v0.2 limitation: the flag is
+unit-scoped, not file-scoped, and must be placed at top level (inside
+a function body it fires during macroexpansion, not execution).
+
+* Errors
+
+| Symbol            | Parent     | Signaled by                            |
+|-------------------+------------+----------------------------------------|
+| =nl-error=        | =error=    | (never directly — common parent)       |
+| =nl-unwrap-error= | =nl-error= | =nl-unwrap= on err/none                |
+| =nl-type-error=   | =nl-error= | any API given a non-Result/Option value |
+| =nl-match-error=  | =nl-error= | =nl-match= value no clause matches      |
+
+* Constraints of =nl-?=
+
+- =nl-?= is only valid inside the body of =nl-defun= / =nl-lambda=.
+  Any other use is an *expansion-time* error, not a runtime
+  =cl-return-from= failure.
+- =nl-?= must not cross a nested plain =lambda= (including
+  =#'(lambda ...)=): the value would escape the defining function's
+  return block.  This is rejected when the enclosing =nl-defun=
+  expands.  A nested =nl-lambda= is fine — it opens its own block.
+- The constraint checker walks the *unexpanded* body.  An =nl-?=
+  produced by another macro's expansion inside the body is not seen by
+  the walker (it will still expand correctly when it appears directly
+  in the body of the =nl-defun=; inside a macro-generated =lambda= it
+  would misbehave).  Keep =nl-?= textually visible in =nl-defun=
+  bodies.
+- =nl-?= handles =Result= only.  Convert Options first with
+  =nl-option->ok=.
+
+* Non-goals
+
+- No ADT / pattern matching here — that is Phase 2a (Doc 169
+  section 3).
+- No change to plain Elisp semantics; nothing is advised or globally
+  modified.
+- Not a monad framework: only Result/Option, no generic typeclass
+  machinery.
+
+* Testing
+
+Host Emacs (part of =make test= at the repo root; the root Makefile
+globs =packages/*/test/nl-*-test.el=):
+
+#+begin_src sh
+emacs --batch -Q -L packages/nl-prelude/src -L packages/nl-prelude/test \
+  -l ert -l nl-prelude-test -f ert-run-tests-batch-and-exit
+#+end_src
+
+Standalone NeLisp (no Emacs, no ert — a minimal shim runs the same
+test bodies):
+
+#+begin_src sh
+./target/nelisp --load packages/nl-prelude/test/nl-prelude-standalone-smoke.el
+#+end_src

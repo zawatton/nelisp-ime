@@ -41,13 +41,98 @@
 
 (declare-function nelisp-bc-run "nelisp-bytecode" (bcl &optional args))
 
-(defvar nelisp-jit-enabled nil
+(defvar nelisp-jit-enabled t
   "When non-nil, `nelisp--make-closure' tries JIT compilation first.
-Failure on unsupported forms falls through to bcl / interpreter.")
+Failure on unsupported forms falls through to bcl / interpreter.
+
+Default became t on 2026-08-16.  It was nil while the translation path
+had never been run over the suite: the first full run with it on found
+three semantic differences from the interpreter -- untranslated special
+forms mistranslated as calls, and arity violations carrying the host's
+error.  Those are fixed and both paths run in CI (`make test-jit' and
+`make test-nojit'), which is what the default rests on.
+
+Bind it nil around anything that asserts the interpreter's or bcl's own
+representation; several tests do, and say why.")
+
+(defvar nelisp-jit-untranslated-special-forms
+  '(and or progn when unless
+    catch throw unwind-protect condition-case
+    defun defmacro defvar defconst defvar-local cl-defun)
+  "NeLisp special forms the JIT does not translate.
+These must DECLINE rather than reach the user-call arm: a special form
+does not evaluate its arguments, so translating one as a call is not a
+fallback but a mistranslation that runs.  Every name the interpreter
+treats specially belongs here until the JIT grows a case for it -- the
+list is the complement of the heads `nelisp-jit--translate-compound'
+handles, taken from `nelisp-eval.el'.")
 
 (define-error 'nelisp-jit-unsupported
   "NeLisp JIT cannot translate this form"
   'nelisp-eval-error)
+
+;;;; Unverified code (Doc 170 section 10)
+
+;; The JIT is the one place code arrives that no build step ever saw.
+;; `nelisp-artifact-compile-file' checks every artifact, and `make
+;; compile' checks every source, but a body reaching the JIT may have
+;; come from `eval' or been assembled at runtime, so neither ran on it.
+;;
+;; Refusing to JIT such a body would not prevent the defect -- the
+;; fallback interpreter runs the same code -- so refusal is not the
+;; default.  What the default does is make the gap measurable: count
+;; what goes by unchecked, so "nothing executes unverified" is a claim
+;; with a number behind it rather than a hope.  A build that wants the
+;; stricter answer sets the policy to `refuse'.
+
+(defvar nelisp-jit-check-policy 'ignore
+  "What the JIT does with a body carrying a `nl-check' finding.
+
+`ignore'  do not check at all -- the default, and free.
+`count'   check and tally, but compile anyway.
+`refuse'  check and decline to JIT, falling through to bcl.
+
+Checking costs a walk of every body the JIT sees, which is a hot path,
+so it is off unless asked for.")
+
+(defvar nelisp-jit-check-kinds
+  '(must-use-discarded resource-untracked resource-leak resource-double)
+  "Finding kinds the JIT counts.  Mirrors `nelisp-artifact-check-kinds'.")
+
+(defvar nelisp-jit-check-seen 0
+  "Bodies the JIT has examined since the last `nelisp-jit-check-reset'.")
+
+(defvar nelisp-jit-check-flagged 0
+  "Of those, how many carried a finding.")
+
+(defun nelisp-jit-check-reset ()
+  "Zero the unverified-code counters."
+  (setq nelisp-jit-check-seen 0)
+  (setq nelisp-jit-check-flagged 0))
+
+(defun nelisp-jit-check-report ()
+  "Return (:seen N :flagged N :policy SYM)."
+  (list :seen nelisp-jit-check-seen
+        :flagged nelisp-jit-check-flagged
+        :policy nelisp-jit-check-policy))
+
+(defun nelisp-jit-check-body (body)
+  "Return non-nil when BODY carries a gated `nl-check' finding.
+Returns nil under the `ignore' policy without looking, and nil when
+`nl-check' is absent -- a soft require, as in the artifact path, so
+this package gains no hard dependency on one Doc 170 section 10 says
+nothing may depend on."
+  (when (not (eq nelisp-jit-check-policy 'ignore))
+    (require 'nl-check nil t)
+    (when (fboundp 'nl-check-forms)
+      (setq nelisp-jit-check-seen (1+ nelisp-jit-check-seen))
+      (let ((flagged nil))
+        (dolist (finding (nl-check-forms body))
+          (when (memq (plist-get finding :kind) nelisp-jit-check-kinds)
+            (setq flagged t)))
+        (when flagged
+          (setq nelisp-jit-check-flagged (1+ nelisp-jit-check-flagged)))
+        flagged))))
 
 (defconst nelisp-jit--inline-primitives
   '(+ - * / mod 1+ 1- < > = <= >=
@@ -211,6 +296,16 @@ for constructs the MVP does not handle."
          ,@(nelisp-jit--translate-body
             sub-body
             (append (nelisp-jit--param-symbols sub-params) env)))))
+   ;; ----- special forms this MVP does not translate ---------------------
+   ;; A special form does not evaluate its arguments, so routing one to
+   ;; the user-call arm below is not a fallback -- it is a mistranslation
+   ;; that runs.  `(condition-case err (/ a b) (arith-error :x))' became a
+   ;; call with `err' evaluated as a variable, which signalled
+   ;; `nelisp-unbound-variable' where the interpreter returns :x.  Decline
+   ;; instead, and the caller falls through to bcl / interpreter, which
+   ;; handle these correctly.
+   ((and (symbolp head) (memq head nelisp-jit-untranslated-special-forms))
+    (signal 'nelisp-jit-unsupported (list (cons head rest))))
    ;; ----- call dispatch -------------------------------------------------
    ((and (symbolp head) (nelisp-jit--primitive-p head))
     ;; Direct host call on an assumed-stable primitive.
@@ -280,7 +375,15 @@ captured-env closures that mutate their captures."
          ;; call, so a `setq' would not persist).  Fall through to bcl /
          ;; interpreter which handle the counter pattern correctly.
          ((and env (nelisp-jit--body-mutates-env-p body env-syms)) nil)
+         ;; Under the `refuse' policy a body carrying a finding falls
+         ;; through to bcl / interpreter, the same way an untranslatable
+         ;; form does.  Under `count' the tally is kept and we compile.
+         ((and (eq nelisp-jit-check-policy 'refuse)
+               (nelisp-jit-check-body body))
+          nil)
          (t
+          (unless (eq nelisp-jit-check-policy 'refuse)
+            (nelisp-jit-check-body body))
           (let* ((translated (nelisp-jit--translate-body body full-env))
                  (host-form
                   (if env
@@ -301,6 +404,13 @@ captured-env closures that mutate their captures."
 On unsupported forms the JIT returns nil and we fall through to
 the original bcl path (which itself may fall through to
 interpreter closure via `nelisp--make-closure')."
+  ;; Deliberately does NOT consult `nelisp-bc-auto-compile'.  That flag
+  ;; is bcl's own -- its docstring scopes it to materialising bodies as
+  ;; "bytecode closures" -- and it is checked inside
+  ;; `nelisp-bc-try-compile-lambda', which this advice runs ahead of.
+  ;; The JIT has its own switch.  Making the JIT honour the bcl flag was
+  ;; tried and broke `nelisp-jit-compile-runs-fib', which sets
+  ;; auto-compile nil precisely to isolate the JIT from bcl.
   (if nelisp-jit-enabled
       (or (nelisp-jit-try-compile-lambda env params body)
           (funcall orig-fn env params body))
@@ -325,6 +435,15 @@ Set `nelisp-jit-enabled' to toggle JIT on/off without uninstalling."
   (and (consp obj)
        (eq (car obj) 'nelisp-bcl)
        (eq (cadr obj) 'nelisp-jit-marker)))
+
+;; Install on load.  `nelisp-jit-enabled' alone decides nothing until
+;; the advice is in place, so leaving installation to an explicit call
+;; would make the default a value nobody acts on.  The advice itself
+;; reads the flag on every call, so installing here does not commit the
+;; session to the JIT -- binding the flag nil still takes the bcl path.
+(unless (advice-member-p #'nelisp-jit--bc-try-advice
+                         'nelisp-bc-try-compile-lambda)
+  (nelisp-jit-install))
 
 (provide 'nelisp-jit)
 ;;; nelisp-jit.el ends here

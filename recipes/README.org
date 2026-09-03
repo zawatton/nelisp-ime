@@ -1,0 +1,218 @@
+#+TITLE: NeLisp Recipes — building applications and services
+
+* What this is
+
+One directory per application shape, each with a skeleton you can copy
+and a smoke that proves the shape still works on your machine before you
+write anything of your own.
+
+Run the smoke first.  A recipe that cannot pass its own =verify.sh= here
+is telling you something about the runtime, the binary in =target/=, or
+the platform, and that is far cheaper to learn now than from a
+half-written service.
+
+* Which shapes are viable today
+
+Verdicts, with the evidence behind each.  Where the evidence is a
+measurement it was taken on this tree; where there is none, the verdict
+says so rather than guessing.
+
+| shape                          | verdict         | evidence                                                                                                   |
+|--------------------------------+-----------------+------------------------------------------------------------------------------------------------------------|
+| short-lived CLI / batch job    | ready           | =recipes/batch-data= passes here; =dist/= ships standalone tarballs for four platforms                      |
+| stdio worker under a host      | ready           | =recipes/stdio-service= passes, including the flush check: a response lands while the pipe is still open    |
+| long-lived resident service    | conditional     | the standalone reader's arena never reclaims — about 560 bytes per evaluated operation, and =garbage-collect= frees none of it (measured 2026-08-17).  Supervise and restart, or run one process per request |
+| native hot path (=.neln=)      | ready on linux-x86_64 | compiles with =:native t= and the compiled code actually runs there: =recipes/native-hotpath/verify.sh= passes both gates, =native-exec-elisp-artifact= on the compiled function returns the right answer, and two independent compiles of the same source are byte-identical (fixed 2026-08-22, see =native-hotpath/README.org= -- the 2026-08-18 blocker was two stacked char-vs-byte defects, not the one first suspected) |
+| HTTP service                   | not viable today | the 20-file =nelisp-http= stack loads and reports its features, but only because =load= continues past a signalled error: its =(require 'url)= / =url-parse= / =url-http= / =dom= all fail, and the first real call dies with =void-function url-generic-parse-url= (measured 2026-08-18, WSL) |
+| GUI (X11)                      | works             | =tools/nelisp-x11-hello.sh= opens a real 460x140 window under WSLg, confirmed in =xwininfo -root -tree=.  Pure Elisp on the X11 core protocol over the socket: no Xlib, no C.  Interactive, so not a headless gate |
+| TUI (async event loop)         | fails today       | =tools/nelisp-async-tty-smoke.sh= dies with =void-variable: (declarations)= loading the host =generator.el=, and reports nothing: it captures the output, compares, and exits 1 in silence (2026-08-18, WSL) |
+| Emacs package via Layer 2      | conditional     | =dev/nelisp-emacs=; its suite reported 127 unexpected results the first time it could run at all            |
+| WASM / browser                 | compiles and runs | =make wasm-smoke= compiles two Elisp functions to wasm32, validates both modules and executes them under node, on Windows and Linux alike (2026-08-18).  =wasm-runtime-image-smoke= is stale: it asks for =--kind neln= with a =.wasm= output and the compiler rejects the pair |
+
+The rule behind the first three rows: *process lifetime is the design
+variable*.  Nothing reclaims memory in the standalone reader, so a
+program that exits is a program that cannot leak.  Choose a shape where
+exiting is normal, and the constraint disappears.
+
+* Runtime surface, measured
+
+Do not read this section for your answer — run the probe:
+
+#+begin_src sh
+tools/ai/nelisp-ai.sh runtime-probe
+#+end_src
+
+Nine capabilities, one line each, from the binary in front of you.  The
+answers differ per binary *and per platform*, and this section used to
+state them as facts; two were wrong within a day of being written.
+
+What two hosts answered on 2026-08-18, same commit:
+
+| capability            | Windows x86_64        | WSL Debian x86_64 |
+|-----------------------+-----------------------+-------------------|
+| =getenv=              | works                 | *nil, always*     |
+| =file-exists-p=       | *nil for a file that exists* | works      |
+| =current-time=        | *(0 0 0 0)* stub      | real clock        |
+| =require= tree feature | file-missing         | file-missing      |
+| =load= missing file   | returns t, silent     | returns t, silent |
+| =write-region= multibyte | signals after writing | signals after writing |
+
+The three in bold are single-platform defects, which is exactly why a
+recipe written on one host cannot be trusted on the other until it has
+run there.  The =write-region= row is dated: fixed 2026-08-22, see
+"Two traps" below.
+
+Beyond the probe, still true of both:
+
+- =read-string=, =read-from-minibuffer= — void.  =read-stdin-bytes= is
+  the only way in.
+- =read= — string streams only; it cannot read from stdin.
+- =re-search-forward=, =mapatoms= — void. =goto-char=/=point=/=point-min=/
+  =point-max= are real as of Doc 188 Phase 1 (2026-08-23,
+  =docs/design/188-buffer-unification.org=) — buffers exist and basic
+  navigation now works (=insert=/=buffer-string=/=with-current-buffer=/
+  =with-temp-buffer=/=generate-new-buffer=/=kill-buffer= are backed by
+  one coherent model instead of the old disconnected-=insert= bug), but
+  *search* (=re-search-forward=, =search-forward=) and *markers/
+  overlays* (Doc 188 P3-P5) do not exist yet.
+- =json-encode=, =sqlite-open= — not in the base runtime; they live in
+  =packages/nelisp-json= and =packages/nelisp-sqlite=.
+- =load= does not stop at an error.  A form that signals inside a loaded
+  file is skipped and the rest of the file runs, so a package whose
+  host-library requires all fail still ends up =featurep= t with half
+  its functions undefined.  That is how the HTTP stack above looks
+  healthy until the first call.
+- =(require 'x)= resolves FEATURE as a literal path: no =load-path=, no
+  =.el= completion, so a file that exists and provides its feature is
+  still unreachable by name.  Load by path, or pass the filename; for a
+  host-only library use =(require 'url-parse nil t)= — the third
+  argument is NOERROR, not the second.
+
+* Two traps that cost the most time
+
+** Multibyte writes used to signal after succeeding (fixed 2026-08-22)
+
+=write-region= verifies its own work by comparing the byte count the
+write returned against a count of its own.  That second count used to be
+a character count, which differs from the byte count for anything
+multibyte, so writing Japanese text raised
+
+: write-region stub: wrf returned 28 (expected 20)
+
+*after the file had already been written correctly*.  Neither the error
+nor its absence told you anything; you had to read the file back and
+compare.
+
+The check now compares against =string-bytes= (the byte-clean
+counterpart of =length=, Doc 161) instead, so it agrees with what was
+actually written and multibyte text no longer signals:
+
+#+begin_src sh
+target/nelisp --eval '(write-region "こんにちは" nil "/tmp/x.txt" nil (quote silent))'
+#+end_src
+
+writes silently, and =/tmp/x.txt= holds the correct UTF-8 bytes.
+
+That fix does not, by itself, make every byte-buffer operation safe.
+=aref= and =length= still decode a string as UTF-8 characters (Doc 161's
+contract) rather than reading raw bytes, so code that measures or reads
+back a buffer containing bytes >= 128 with =aref=/=length= instead of
+the byte-clean =string-byte=/=string-bytes= pair gets a wrong answer
+with no signal at all -- the write succeeds, the count agrees with
+itself, and the content is wrong.  =base64-encode-string= and the ELF
+writer's own section-size arithmetic both had exactly that shape of bug,
+and it is what actually blocked =native-hotpath= on Linux (see
+=native-hotpath/README.org=), not the write-region check above.
+
+** POSIX-looking absolute paths resolve against the current drive
+
+On Windows, =/tmp/out.txt= inside the runtime becomes =<current
+drive>:/tmp/out.txt=, while the same string in a shell means =%TEMP%=.
+Write and read agree with each other, so a round trip passes while the
+file sits somewhere you never look.  Confirmed on both drives: the same
+program run from a =D:= checkout wrote =D:\tmp=, and from a =C:=
+checkout wrote =C:\tmp=.  Pass drive-qualified paths, or paths relative
+to the working directory.
+
+(Both were found by running the recipes below, which is what the smokes
+are for.)
+
+* Naming: decide your namespace on line 1
+
+Elisp has one obarray.  =(defun foo ...)= is assignment to a global
+name and a second definition silently wins, so the first thing a new
+file does — before any of the design you care about — is claim a prefix.
+Changing that decision later is a rename of everything.
+
+=packages/nl-ns/= checks the claim without rewriting any code:
+
+- every definition carries its file's namespace prefix.  The prefix is
+  inferred from the dominant one in the file; =nl-ns-declare= overrides
+  the inference, and a file with no dominant prefix is treated as
+  deliberately global.
+- a =--= name is private to its file.  Referencing another file's is
+  =ns-private-escape=.
+- a cross-file reference wants an explicit =(require ...)=; without one
+  the dependency exists only in load order.
+- shadowing a host definition belongs behind =(unless (fboundp 'name)
+  ...)=.  A shim whose own docstring calls it partial while it replaces
+  a host function is reported as =ns-partial-override= — the highest
+  value finding in the set, because that shape has already produced a
+  silent nil deep in unrelated code.
+
+Check it:
+
+#+begin_src sh
+tools/ai/nelisp-ai.sh ns            # the recipe skeletons, must be clean
+tools/ai/nelisp-ai.sh ns FILE...    # anything else
+make ns-inventory                   # the whole tree, ratcheted to a baseline
+#+end_src
+
+=nl-ns-in= is the optional writing half: =nl-ns-define= declares a
+closed =:members= set and =nl-ns-in= rewrites the short names in a block
+into qualified globals.  It is a genuine convenience with a genuine
+cost — each member name is written twice, and quoted data is never
+rewritten (=ns-quoted-member= marks where that bites).  The recipes here
+stay with plain prefixes on purpose: in a runtime whose failures are
+already dominated by silent wrong values, what the backtrace prints
+should be what you typed.
+
+* Available recipes
+
+| directory           | shape                                                              |
+|---------------------+--------------------------------------------------------------------|
+| =stdio-service/=    | a worker driven by a host process over stdin/stdout, one s-expression per line |
+| =batch-data/=       | read a delimited file, aggregate it, write a report, exit          |
+| =native-hotpath/=   | compile the fast functions to a =.neln= and check the manifest says they went native |
+| =checked-resources/= | reach a shared mutable buffer only through borrows, so aliasing bugs signal instead of corrupting |
+
+* Memory safety, when you want it
+
+=packages/nl-safe/= brings Rust-shaped borrow rules to ordinary NeLisp
+code: a value in a cell, shared borrows that may coexist, exclusive
+borrows that may not, and =nl-borrow-error= at the moment the rule is
+broken rather than a wrong value later.  =recipes/checked-resources/= is
+the usable subset with a smoke that provokes a real violation — and that
+measures the cost on your machine instead of quoting a number.
+
+The neighbouring packages, for when this is not the right shape:
+=nl-check= (static findings), =nl-contract= (boundary contracts with
+blame), =nl-resource= (deterministic drop), =nl-parens= (structural
+repair).  They are libraries, not a mode you switch on.
+
+* Adding a recipe
+
+Four pieces, no exceptions:
+
+1. =README.org= — what it is, what it needs, and *what it cannot do*.
+2. =skeleton/= — the smallest thing that actually runs.
+3. =verify.sh= — a smoke that reports a real case count through
+   =tools/ai/gate-report.sh=.  Fake counts defeat the whole mechanism;
+   see =tools/ai/README.md=.  The skeleton must also pass
+   =tools/ai/nelisp-ai.sh ns=: it is what people copy, so its names are
+   the ones that spread.
+4. =PITFALLS.md= — what bit you while writing it, with the symptom as
+   it actually appeared.  The symptom is the searchable part.
+
+Then add the gate name to =tools/ai/gates.expected= with a trailing =?=
+so it is reported when run without being required of every tree.

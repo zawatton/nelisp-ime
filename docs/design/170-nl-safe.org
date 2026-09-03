@@ -1,0 +1,614 @@
+#+TITLE: Doc 170 — nl-safe / nl-contract / nl-check 詳細設計
+#+AUTHOR: zawatton
+#+DATE: 2026-08-15
+#+STARTUP: overview
+#+OPTIONS: toc:2 num:t
+
+* ステータス
+
+| 項目     | 値                                              |
+|----------+-------------------------------------------------|
+| Doc 番号 | 170                                             |
+| 状態     | ACTIVE (Stage 1/2/3 SHIPPED 2026-08-15)         |
+| 親       | Doc 168                                         |
+| 対象     | packages/nl-safe, packages/nl-contract, packages/nl-check |
+| 関連     | Doc 79 v7 (GC), Doc 76 (OS 面移行)              |
+
+* 1. 前提の整理
+
+NeLisp は GC を持つ動的言語であり、通常の Lisp コード層は既にメモリ安全。
+危険なのは *ランタイム実装層* である。
+
+| 危険源             | 具体例                                  |
+|--------------------+-----------------------------------------|
+| 生ポインタ         | raw memory access, mmap 領域            |
+| syscall 面         | =syscall-direct=, 可変長引数, fd        |
+| アリーナ           | =frame-alloc=, bump ポインタ            |
+| ネイティブ出力     | asm エンコーダ、リロケーション          |
+| 並行性             | =clone(2)= 共有アドレス空間             |
+
+「Rust 的な安全性」の要求は、実際には性質の異なる3つに分解される。
+
+1. *メモリ安全性* — use-after-free、境界外アクセス
+2. *エイリアシング安全性* — 共有と可変の同時成立
+3. *資源安全性* — 解放忘れ、二重解放（厳密にはメモリ安全性ではない）
+
+本設計はこの3つを別々の機構で扱う。
+
+* 2. 中核判断：動的検査を先に置く
+
+完全な借用検査器は Elisp では現実的でない。Rust のそれは数万行あり、
+かつ =eval= と実行時再定義がある環境では健全性が保証できない。
+
+代わりに Rust の =RefCell= を全面採用した設計を第一段とする。
+「共有と可変の排他 (aliasing XOR mutation)」を実行時カウンタで強制する。
+
+*得られるもの*:
+
+1. 今週書ける
+2. 実際の違反データが取れる（静的検査器の設計入力になる）
+3. API 構文が先に固まる。後から同じ構文の上に静的パスを載せられる
+4. ビルドフラグで no-op 化でき、リリース性能を損なわない
+
+* 3. Stage 1 — 動的借用 =nl-cell=
+
+** 3.1 API
+
+#+begin_src elisp
+(nl-defcell buf (make-vector 1024 0))
+
+(nl-with-borrow-mut (b buf)      ; 排他借用
+  (aset b 0 42))
+
+(nl-with-borrow (b buf)          ; 共有借用（複数可）
+  (aref b 0))
+#+end_src
+
+** 3.2 表現と検査規則
+
+セルは =[nl--cell VALUE STATE]= のベクタ。STATE は整数:
+
+| STATE | 意味                 |
+|-------+----------------------|
+|     0 | 未借用               |
+|   n>0 | 共有借用 n 個        |
+|    -1 | 排他借用中           |
+
+- =nl-with-borrow=: STATE が -1 なら =nl-borrow-error= を signal、
+  それ以外は +1 して本体を実行、=unwind-protect= で -1 して戻す
+- =nl-with-borrow-mut=: STATE が 0 でなければ signal、
+  -1 にして本体を実行、=unwind-protect= で 0 に戻す
+
+** 3.3 エラー報告
+
+違反時のエラーには以下を含める。静的検査器の設計入力になるため、
+情報量を惜しまないこと。
+
+- セル名、既存借用の種別
+- 既存借用を取得した位置（=nl-strict= 下ではソース位置を埋め込む）
+- 現在の借用の位置
+
+*違反ログの収集*: =nl-safe-log-violations= を有効にすると、
+違反を =nl-safe--violation-log= に蓄積する。Doc 168 Phase 6 の
+着手判断（静的に判定可能な違反の割合）はこのログを根拠とする。
+
+** 3.4 並行性との関係
+
+=clone(2)= 経路（共有アドレス空間）では STATE の更新に
+=atomic-fetch-add= を用いる。=fork(2)= 経路は COW 隔離のため不要。
+
+* 4. Stage 1 — fat pointer と unsafe 境界
+
+** 4.1 表現
+
+生ポインタを裸の整数として扱うことを禁じ、以下に包む。
+
+#+begin_src elisp
+;; [nl--ptr BASE LEN GENERATION]
+#+end_src
+
+- =BASE=: 先頭アドレス
+- =LEN=: 有効長（バイト）
+- =GENERATION=: アロケータが払い出す世代番号
+
+** 4.2 アクセサ
+
+#+begin_src elisp
+(nl-ptr-ref-u8  PTR OFFSET)
+(nl-ptr-set-u8  PTR OFFSET VALUE)
+(nl-ptr-ref-u64 PTR OFFSET)
+(nl-ptr-slice   PTR OFFSET LEN)   ; 派生ポインタ。範囲を親に制限
+#+end_src
+
+各アクセサは検査有効時に以下を行う:
+
+1. =OFFSET + SIZE <= LEN= の境界検査
+2. =GENERATION= とアロケータの現世代の照合（use-after-free 検出）
+
+検査無効時（リリースビルド）は素の =raw-memory-ref= に展開される。
+
+** 4.3 unsafe 境界の確立
+
+*これが本 Stage の本質*。生ポインタを直接生成・変換できる
+プリミティブを列挙し、それ以外の場所からの使用を禁じる。
+
+#+begin_src elisp
+(nl-unsafe
+  ;; 生ポインタを扱えるのはこのブロック内のみ
+  (let ((raw (syscall-direct 9 ...)))       ; mmap
+    (nl-ptr-make raw len (nl-alloc-generation))))
+#+end_src
+
+- =nl-unsafe= ブロック外での =nl-ptr-make= / =syscall-direct= /
+  =raw-memory-*= の使用は、=(nl-strict t)= 下で展開時エラー
+- =nl-check= に「unsafe 面の棚卸し」レポート機能を持たせ、
+  =nl-unsafe= ブロックの総数と位置を CI で追跡する
+
+*受け入れ条件*: unsafe プリミティブの総数を 20 個以内に固定し、
+CI で増加を検出する。Rust の safe core / unsafe kernel と同じ構造。
+
+* 5. Stage 2 — 検証アロケータ（ランタイム側）
+
+ライブラリではなくビルドフラグだが、*投入労力あたりのバグ検出数が
+全項目中で最大* と見積もる。自作アロケータを持つ強みが最も効く。
+
+** 5.1 機能
+
+| 機能            | 内容                                             |
+|-----------------+--------------------------------------------------|
+| redzone         | 各割当の前後に番兵バイトを置き、free 時に破損検査 |
+| poison          | free 時に領域を既知パターンで埋める              |
+| 世代タグ        | 割当ごとに世代番号。fat pointer と照合           |
+| 割当元記録      | =nl-strict= 下で割当位置を記録し、報告に含める   |
+| リーク検出      | 終了時に未解放の割当を一覧                        |
+
+** 5.2 有効化
+
+=NELISP_ALLOC_CHECK=1= 環境変数、またはビルドターゲット
+=make standalone-reader-checked= で有効化する。既定は無効。
+
+*実装ノート (2026-08-15)*: env probe を持つのは windows-x86_64 target
+のみ (macos-aarch64 の =nl_os_environ_init= は nil を書く)。従って
+boot 時 arming は Windows 限定で、CI の checked smoke も Windows
+レーンに配線。mid-run の =(nelisp--debug-switch 19)= は stamping+
+poison のみで verify は arm しない (pre-enable block の偽陽性回避)。
+Linux/macOS の env 継承・自動 call-site 捕捉・exit 時 leak 自動出力は
+deferred。
+
+*実装ノート (2026-08-19) — Linux で arm 可能になった*: 上の deferred が
+本 Stage の価値をほぼ全部止めていた。§5 冒頭は本項目を「投入労力あたりの
+バグ検出数が全項目中で最大」と見積もっているが、arm できるのが Windows
+だけなら、開発の大半が起きる platform で検証は一度も走らない。実測
+(linux-x86_64, 2026-08-19、=NELISP_ALLOC_CHECK=1= を export し =getenv= が
+"1" を返す状態):
+
+: boot                            (enable 0 armed 0 …)
+: (nelisp--debug-switch 19) 後    (enable 1 armed 0 …)
+
+=armed= が 0 のまま = redzone 検証は一度も実行されていなかった。switch 19
+は設計どおり arm しないので、Linux には armed verifier への経路自体が
+無かった。
+
+修正は新プリミティブを必要としない。Linux の entry stack が既に環境を
+持っている: SP に argc / argv[0..] / NULL / envp[0..] / NULL が並ぶので
+envp[j] は slot =argc+2+j=。argv walk が使う =sp0= をそのまま渡し、
+=nl_posix_environ_walk= が =(NAME . VALUE)= alist を構築しながら
+=nl_alloc_check_env_probe_bytes= (Windows の UTF-16LE probe と同形の
+byte 版) を呼ぶ。=nl_os_environ_init= は per-target hook として arity を
+統一した。
+
+名前比較が u32×4 + u16 なのは、u64×2 だと先頭語が 4.71e18 となり
+=most-positive-fixnum= 2.31e18 を超えて bignum で code generator に届く
+ため (実測)。
+
+結果 (同日、=make standalone-reader-checked= を linux-x86_64 で):
+
+: run 1 (env 無し)  (0 0 …)                     既定 off を維持
+: run 2 (compute)   43 / 43                     checked suffix は挙動を変えない
+: run 3 (armed)     (1 1 370905 370905 269820 0 0 42 …)
+
+=armed=1=、verified-frees 269820、redzone violations 0、alloc-site 42 が
+round-trip。CI の checked smoke を Linux レーンにも配線した。
+
+prelude の =/proc/self/environ= 読み出しは残るが、boot walker が先に
+alist を埋めた場合は読まない fallback に降格した。/proc 経路は boot
+watermark 凍結後に走るので、arm 判断には原理的に間に合わない。
+
+macOS は no-op のまま。=nl_os_argv_init= が sysctl KERN_PROCARGS2 で argv
+を再構築する target であり、=sp= がこの walk の前提とする vector では
+ないため (当て推量で歩けば stack 上の任意の値を読む)。
+
+** 5.3 CI ゲート
+
+既存の soak テスト（1h / RSS 増加 5MB 未満）を、
+検証アロケータ有効版でも実行する。redzone 破損・リーク検出を
+それぞれ blocker とする。
+
+*実装ノート (2026-08-19) — SHIPPED*: =make standalone-reader-checked-soak=。
+§5.2 の boot arming が Linux で効くようになって初めて意味を持つ項目。
+
+- **ラウンドは 1 プロセス内**で回す。最初の実装は各ラウンドを別 =--load= に
+  していたが、それでは live-blocks が構造上必ず一致し **leak blocker が
+  発火しえない**。検査にならない検査は無いより悪いので作り直した
+- blocker 2 つ: =violations != 0= (redzone)、および round 2 以降の
+  live-blocks 増加 (leak)。各ラウンドは =garbage-collect= で終わるので、
+  残っているものは garbage ではなく retention
+- round 1 を比較対象にしないのは prelude 読み込みの一回限りの確保があるため
+- 追加で「enable/armed が 1 でない」「verified-frees が 0」も FAIL にする。
+  どちらも「下の検査が実は何も見ていなかった」状態を素通りさせないため
+- known-answer で leak blocker の発火を確認: 2000 cons を GC 越しに保持すると
+  live-blocks が 153479 → 157705 → 161705 と増え、gate が FAIL する
+- 実測 (3 rounds): verified-frees 3122456 → 5811706 → 8501170 (同一プロセスで
+  累積)、violations 0、live-blocks 147619 → 147845 → 147845 で平坦
+- 1h 壁時計ではなくラウンド反復にした。時間はソークの確信を、反復はリークの
+  確信を与える。リーク検査に要るのは後者
+- 併せて =alloc-check-collect= に記録されていた欠陥 (prelude load 後の
+  =garbage-collect= が =NELISP_ALLOC_CHECK=1= で無言終了、2026-08-15 の binary)
+  の再現を試み、**現行 binary では解消**を確認 (5 回とも rc=0、同一レポート)
+
+* 6. Stage 3 — 資源と Drop
+
+** 6.1 API
+
+#+begin_src elisp
+(nl-defresource file-handle
+  :drop (lambda (fd) (nl-close fd)))
+
+(nl-with-resource (fd (nl-open "/tmp/x"))
+  (nl-read fd 100))                ; スコープ離脱時に自動 drop
+#+end_src
+
+- =nl-with-resource= は =unwind-protect= に展開する
+- 二重 drop は実行時に検出して signal する（drop 済みフラグ）
+
+** 6.2 =nl-must-use=
+
+#+begin_src elisp
+(nl-defun nl-open (path)
+  (declare (nl-must-use t))
+  ...)
+#+end_src
+
+戻り値が捨てられている呼び出しを、=nl-strict= 下で展開時に検出する。
+Rust の =#[must_use]= に相当。
+
+** 6.3 線形性検査（展開時、限定範囲）
+
+「ちょうど一度だけ消費される」ことの検査は、対象を
+fd / mmap 領域 / 外部バッファに絞る。検査対象が小さいほど
+検査器は小さく、偽陽性も減る。
+
+*適用範囲*: =nl-defun= の本体内で、=nl-defresource= 型の値が
+束縛から離脱するまでの経路を追う。ラムダに捕捉された時点で
+追跡を放棄し「未検査」と報告する（不健全であることを明示する）。
+
+* 7. Stage 4 — 契約 =nl-contract=
+
+Racket 方式。静的型を持たない代わりに、モジュール境界で動的に検査し、
+違反時に *責任の所在* を報告する。
+
+#+begin_src elisp
+(nl-provide/contract
+  (parse-config (-> string? (nl-result-of hash-table? symbol?))))
+#+end_src
+
+- 契約違反時のメッセージに「呼び出し側が破った / 実装側が破った」を明記する
+- =nl-strict= を宣言していないファイルとの境界で特に有用
+
+** 7.1 位置づけ
+
+Doc 168 §3.4 の「健全性の主張範囲」を実装する機構。
+strict なコンパイル単位の外側から入ってくる値を、境界で検査する。
+
+* 7.2 Stage 5 のデータ供給（2026-08-16 実測）
+
+Stage 5 の着手ゲート（動的に捕捉した違反のうち静的判定可能なものが
+50% 超）は、**評価するためのデータが存在しない** という構造的問題を
+抱えていた。=nl-safe--violation-log= は誰かが検査を叩くまで空であり、
+cell / fat pointer / 契約を実利用しているコードが tree に無いため。
+
+暫定の供給路として =make nl-violation-corpus= を追加した。検査経路を
+実際に叩くテスト群を logging 有効で走らせ、=.nl-violations/corpus.log=
+（git 管理外）へ追記して集計を出す。初回 46 records（contract 16 /
+bounds 12 / borrow 8 / resource 5 / generation 5）。
+
+*ただしこれはテスト由来のコーパス* であり、意図的に違反を起こして各
+種類がほぼ均等に出る。パイプラインとレコード形状の検証にはなるが、
+**実使用のサンプルではない**。=:static= 欄（静的判定可能か）は人間が
+レコードを読んで付けるため、現状の集計は「gate: NOT EVALUABLE」を返す。
+
+*従って Stage 5 の前提条件は「実データ」ではなく「実採用」である。*
+nl-safe / nl-contract をどこか実際のモジュール境界で使うまで、この
+ゲートは判定できない。
+
+* 8. Stage 5 — 静的線形性検査（条件付き）
+
+*着手前にゲートがある*（Doc 168 §5 Phase 6）。
+
+- 条件: =nl-safe--violation-log= が捕捉した違反のうち、
+  静的に判定可能なものが 50% を超えること
+- 下回る場合は本 Stage を中止し、動的検査の改善に振り向ける
+
+この判断を先送りしないこと。借用検査器の設計は面白いが、
+実データが支持しない場合の投資回収は見込めない。
+
+** ゲート判定の結果（2026-08-16）
+
+*判定: 着手しない。* ただし理由は「50% を下回った」ではない。
+*母集団が空だった*。
+
+3 経路で独立に測定した:
+
+| 経路                     | 母集団 | 実コード由来の違反 | 手段 |
+|--------------------------+--------+--------------------+------|
+| 検査を駆動する 3 スイート |   46件 | 0（全て人工の負例） | =make nl-violation-corpus= |
+| フルスイート 4980 tests  |   46件 | 0（新規レコードなし） | =scripts/nl-safe-collect-wide.el= |
+| JIT（未検証コード経路）  |   10件 | 0（flagged 1 件は fixture） | =make jit-unverified= |
+
+2 行目が効いている。1 行目のコーパスツールは *テストファイルしか走らせ
+ない* ので、構造上テスト由来の違反しか報告できない。全スイートを走らせ
+ても新規レコードが 1 件も出ないことが、「実コードは違反を出さない」で
+はなく *実コードは nl-safe を使っていない* を裏づける。
+
+nl-safe API の実利用も測った:
+
+| API                                    | テスト参照 | 実コード参照 |
+|----------------------------------------+-----------+--------------|
+| =nl-with-borrow= / =-mut=              |         2 | *0*          |
+| =nl-ptr-ref-u8= / =-set-u8= / =-slice= |       1-2 | *0*          |
+| =nl-resource= / =nl-with-resource= / =nl-drop= | 1-6 | 1        |
+
+唯一の「1」は =packages/nl-check/src/nl-check.el= — 検査器が名前を知って
+いるだけで、リソースを確保しているコードではない。
+
+したがって「実コード由来の違反ゼロ」は「実コードは健全」ではなく
+*実コードは nl-safe を一度も使っていない* と読む。
+
+** 着手できない根本原因
+
+: §9 の予算 15% がインタプリタ経路で構造的に達成不可能
+:   → 実コードに nl-safe を入れられない（入れれば予算違反が確定）
+:   → 使われないので違反データが集まらない
+:   → 本節のゲートが判定不能
+:   → Stage 5 に着手できない
+
+したがって「動的検査の改善に振り向ける」の中身は、検査の *精度* 改善で
+はない。§9 の経路別予算の再定義（実施済み）と、AOT コンパイラの検査除
+去パスの実装である。それが入れば nl-safe を実コードで使え、違反データが
+集まり、本節のゲートが初めて実データで判定できる。
+
+再判定は、実コードでの nl-safe 利用が始まってから行う。
+
+* 9. 性能予算
+
+予算は *実行経路ごとに分ける*（2026-08-16 改訂）。当初は経路を区別せず
+借用 15% / fat pointer 20% と定めていたが、実測の結果その値はインタプ
+リタ経路では構造的に達成不可能であり、達成できない予算は測っても行動に
+繋がらないため。
+
+| 経路                          | 許容オーバーヘッド      |
+|-------------------------------+-------------------------|
+| 検査無効（リリース）          | 0%（展開後のコードが同一であること） |
+| インタプリタ経路（ホスト Emacs / standalone reader） | 予算なし（動作すること） |
+| AOT ネイティブ経路 =nl-cell= 借用 | 有効時 15% 以内     |
+| AOT ネイティブ経路 fat pointer アクセス | 有効時 20% 以内 |
+| 検証アロケータ                | 予算なし（デバッグ専用） |
+
+** なぜインタプリタ経路に予算を課さないか
+
+借用は「取得・本体・非局所脱出でも解放」という形を必要とし、その *形
+だけ* のコストを測ると（検査の中身を一切含まず）:
+
+| 形                                  | baseline 比 |
+|-------------------------------------+-------------|
+| =(aref v 0)=                        | 1.00x       |
+| =let= + =aref=                      | 1.31x       |
+| + =unwind-protect=                  | *1.48x*     |
+| + cleanup に no-op 呼び出し 1 つ    | 2.11x       |
+| + acquire/release の形（呼び出し 2 つ） | *2.69x*  |
+
+=unwind-protect= を置いた時点で 1.15x を超える。ここに nl-safe のコード
+は 1 行も入っていない。したがって helper をどれだけ最適化しても、この
+経路で 15% には到達しない（実測: ホスト 12.77x、standalone reader
+5.00x）。
+
+これは実装の不足ではなく言語の床であり、予算を緩めて 3x と書き直すのは
+「今日の実測を書き写す」ことにしかならない。そうした予算は二度と失敗せ
+ず、性能が劣化しても誰も気づかなくなる。
+
+** なぜネイティブ経路には 15% を維持するか
+
+Java・Go・Rust で境界検査が実質無料なのは、検査が安いからではなく
+*コンパイラが冗長な検査を除去する* からである（JIT の hoisting、Go の
+BCE、LLVM の最適化）。15% は「検査を軽くする」目標ではなく *AOT コンパ
+イラに検査除去パスを実装する* 目標として保持する。
+
+fresh/non-escaping cell 向けの限定検査除去 pass は
+=lisp/nelisp-aot-compiler.el= に実装済みである。aliasing しうる cell は
+保守的に対象外へ残すため、未達時は「目標が不適切」ではなく「解析範囲が
+まだ不足している」と読む。
+
+*** ネイティブ予算の実測（2026-08-16）
+
+=make nl-safe-native-bench= は in-process loader 上で checked/plain の
+=.neln= を実行する。=N=2000、best of 7:
+
+| 対                       |  checked |   plain |  比 | 予算    |
+|--------------------------+----------+---------+-----+---------|
+| borrow read (shared)     | 9653.4ns | 1519.0ns | 6.36x | <=1.15x *FAIL* |
+| borrow, no type check    | 2281.5ns | 1592.0ns | 1.43x | (内訳)  |
+| borrow (fresh, elided)   | 1384.0ns | 1444.0ns | 0.96x | (除去)  |
+
+*予算は未達である。* 予算行は 1 行目だけで、残りは内訳と除去 pass の
+成果であり合否ではない。
+
+内訳が主因を示す。state の read/increment/decrement だけなら 1.43x で、
+型検査を足すと 6.36x になる。=vectorp= / =length= / =eq= にネイティブ
+lowering が無く、1 反復あたり 3 回のディスパッチャ往復が入るためである
+(plain 側の extern 集合にはディスパッチャが 1 つも無い)。*従って梃子は
+借用の設計ではなく =nl-cell-p= のネイティブ化である。*
+
+2026-08-16 に一度 *0.99x で予算を満たす* と記録したが、これは誤りだった。
+当時の fixture は借用をループの外に出しており、さらに除去 pass がその形を
+丸ごと消していたため、checked と plain が同一バイト数・同一スロット数に
+コンパイルされていた。*同一プログラム同士を比較していた。* 現在のベンチは
+比を出す前に両側が別物であることを検査し、一致していれば拒否する。
+
+除去 pass 自体にも健全性の欠陥があった。適格条件が =(vector ...)= で
+あることしか見ておらず、cell でないベクタへの借用まで消していた。
+=nl-with-borrow= は借用前に =nl-cell-p= を検査して非 cell なら
+=nl-type-error= を送出するので、除去はその検査ごと消していたことになる。
+現在は =(nl-cell V)= か =(vector 'nl--cell V 0)= かつ state リテラルが 0 の
+場合のみ適格とする。*検出器を消す最適化は、最適化対象の機能を否定する。*
+
+解析は除去しない理由も保持する。cell escape、state 観測、複数経路、
+非局所制御、ネスト借用、排他借用を検出したときは checked path を残す。
+fat pointer も fresh allocation・literal length/generation・全 read が literal
+in-range であることを証明した場合だけ raw read へ下げる。fat pointer の 2 対は
+現在も checked/plain が同一にコンパイルされるため、予算行ではなく除去の
+実証として報告する。動的 offset、範囲外、alias、escape は checked path に残す。
+
+nl-safe 固有の問題ではない。そして *本節が当初書いた「in-process ローダ
+が無い」も、次に書いた「統合が残っている」も、どちらも誤りだった*
+（2026-08-16 訂正）。実機で確かめた結果:
+
+: ./target/nelisp --neln-selftest   →  exit 42   （inc1(41) = 42）
+
+外部シンボルを持つ =.neln= のネイティブコードが、実リーダの中で
+in-process 実行されている。gate 6 は *統合済み* である。
+
+| 要素 | 状態 |
+|------+------|
+| mmap / PLT 風スタブ / plt32 再配置 / 境界スロット 17 個 / =call-ptr= | 実証済（3 テスト、x86_64 Linux） |
+| 実 =nelisp_aot_builtin_call1= へのブリッジ | =reader-neln-demo.o= としてリーダにリンク済み |
+| リーダ内での実行 | =--neln-selftest= が通る |
+
+=nl_neln_demo_call1_bridge= の "demo" はデモ *プログラム* の意味で、
+ブリッジ自体は =(extern-call nelisp_aot_builtin_call1 ...)= と実物を
+呼ぶ。名前から代替物と推測すると間違える。
+
+以下の =nelisp-artifact-native-exec= はこれとは *別物* で、docstring が
+設計上の範囲を明言している:
+
+#+begin_quote
+This is the first native-execution spike: it works for the reloc-free
+leaf functions AOT emits today (plain C integer ABI, no boundary
+slots).  The host C toolchain (cc + objcopy) acts as the loader; an
+in-process standalone mmap+reloc loader for the general boundary-ABI
+case is the remaining §6.4 work.
+#+end_quote
+
+つまりこの API は「整数 ABI の *葉関数* を C ドライバにリンクして走らせ
+る spike」であり、生成した C ドライバはオブジェクト単体をリンクする。
+外部シンボル（Elisp ヘルパ）は未解決のままなのでリンクが落ちる。引数も
+=atol= 経由の整数に限られるため、そもそも =nl-cell= を渡せない。
+
+*本番のネイティブ実行経路ではない*。欠けているのは AOT のリンク能力では
+なく、*Doc 142 §6.4 の残作業である in-process mmap+reloc ローダ* である。
+
+（Windows ホストではプリミティブのみの葉関数も link failed。上表は WSL
+上の測定。ホストの C ツールチェーン差であり、境界とは別の話。）
+
+したがって着手順序はこうなる:
+
+1. ~~Doc 142 §6.4 gate 6~~ — *統合済み*（=--neln-selftest= が通る）
+2. ~~ネイティブ経路のベンチをリーダ内 in-process ローダへ載せ替える~~ —
+   実装済み。=make nl-safe-native-bench= が checked/plain の .neln を測定する
+3. fresh/non-escaping cell の検査除去 pass は実装済み（現状 1.00x）。
+   次は通常の aliasing cell へ安全に拡張する
+4. nl-safe を実コードに導入する
+5. 違反データが集まり §8 のゲートが判定可能になる
+6. Stage 5 の可否を実データで決める
+
+=bench/nl-safe-native-bench.el= は現在 in-process loader を直接使う。
+
+** 位置づけ
+
+インタプリタ経路の =nl-cell= 借用および fat pointer 検査は *デバッグ時
+の検査* とする。Swift の排他性検査が debug で有効・release で無効を既定
+とするのと同じ扱いであり、本節が検証アロケータに与えている区分と揃う。
+
+Rust の借用検査は完全にコンパイル時で実行時コストを持たない。=nl-cell=
++ =nl-with-borrow= が対応するのは =&mut= ではなく =RefCell= であり、
+Rust も =RefCell= を「必要な箇所で局所的に使う実行時コスト付きの道具」
+と位置づけている。全体予算を課す対象ではない。
+
+** 測定
+
+- =make nl-safe-bench= — ホスト Emacs
+- =bench/nl-safe-standalone-bench.el= — =target/nelisp=
+
+いずれも *報告であってゲートではない*。達成不能な予算でビルドを落として
+も、誰も行動できない赤信号が増えるだけである。ネイティブ経路の検査除去
+パスが入った時点で、その経路のみゲート化する。
+
+*検査無効時に展開後コードが素の版と同一になること* を ERT で検証する
+（マクロ展開結果の比較）。これが崩れると「ビルドフラグで消せる」という
+前提が失われ、経路別予算そのものが成り立たなくなる。実装済み
+（=nl-safe-test.el= に 7 件、=nl-resource-test.el= に 1 件）。
+
+* 10. nl-check の位置づけ
+
+- 展開時検査パスを一手に引き受ける独立パッケージ
+- *どのパッケージからも依存されない*（Doc 168 §4.1、一方向）
+- CI で依存方向を検証する
+- 提供機能:
+  - =nl-strict= 宣言の処理
+  - 網羅性検査（Doc 169 §3）
+  - unsafe 面の棚卸しレポート
+  - =nl-must-use= 検査
+  - 線形性検査（Stage 3 / Stage 5）
+
+* 11. 段階まとめ
+
+| Stage | 内容                     | 層     | 依存           |
+|-------+--------------------------+--------+----------------|
+|     1 | =nl-cell= / fat pointer  | L1     | nl-prelude     |
+|     2 | 検証アロケータ           | 実装層 | なし（独立）   |
+|     3 | 資源 / Drop / must-use   | L1+検査 | Stage 1        |
+|     4 | 契約                     | L1     | Stage 1        |
+|     5 | 静的線形性検査           | 検査   | Stage 3 の実データ |
+
+Stage 1 と Stage 2 は独立しており並行できる。
+Stage 5 は条件付きであり、着手を既定としない。
+
+* 12. 受け入れ条件（Stage 1）
+
+| 項目           | 条件                                           |
+|----------------+------------------------------------------------|
+| ERT            | 60 件以上、unexpected 0                        |
+| 展開同一性     | 検査無効時の展開結果が素の版と一致すること     |
+| unsafe 棚卸し  | プリミティブ 20 個以内、CI で増加検出          |
+| standalone     | =target/nelisp= 上で green                     |
+| 性能           | §9 の予算内（bench/ に計測を追加）             |
+| 違反ログ       | =nl-safe--violation-log= が Phase 6 判断に足る情報を持つ |
+
+*達成記録 (2026-08-15)*: Stage 1 SHIPPED (ERT 89 件 host+standalone
+green、unsafe 棚卸し 20 個以内テスト付き、raw-memory backend は差替
+可能な間接層として実装 = standalone 実メモリ統合点)。Stage 2 SHIPPED
+(redzone/poison/世代タグ/leak report、5205 行 prelude 全ロードで 59 万
+alloc 検査・違反 0、check-off 時 byte-identical)。bench/ の性能計測
+(§9 予算検証) は follow-up。
+
+*達成記録 (2026-08-15) — Stage 3*: SHIPPED。=packages/nl-safe/src/nl-resource.el=
+(=nl-defresource= / =nl-resource= / =nl-drop= / =nl-forget= /
+=nl-with-resource= / =nl-with-resources=、二重 drop と use-after-drop
+を signal、liveness flag は drop 関数実行の *前* に落とすので releaser が
+signal しても再 drop 不可) + =packages/nl-check= (§6.2 =nl-must-use=、
+§6.3 資源線形性、§4.3 unsafe 呼出棚卸し、Doc 168 §4.1 の一方向依存を
+維持)。ERT 60 件 (nl-resource 29 + nl-check 31) が host Emacs と
+=target/nelisp= standalone の両方で green、=byte-compile-error-on-warn=
+clean。違反は =:kind= =resource= で既存 =nl-safe--violation-log= に載る
+ので Phase 6 ゲートのデータ源が資源軸にも広がった。
+
+線形性検査の健全性は *限定的であることを明示* する設計にした: lambda
+捕捉・未知関数への引き渡しを検出したら追跡を放棄し =resource-untracked=
+として報告する (黙って解析から落とさない)。=resource-leak= が空である
+ことは「追えた束縛の範囲で漏れ無し」であって「漏れ無し」ではない。
+
+Stage 4 (=nl-contract=) は未着手。
+
+Stage 5 (静的線形性) は §8 のゲートを 2026-08-16 に判定し *着手しない*
+と決めた。理由は 50% を下回ったことではなく、母集団が空だったこと
+（実コードに nl-safe の利用者が居ない）。再判定の条件と根本原因は §8 を
+参照。

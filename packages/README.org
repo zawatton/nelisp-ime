@@ -25,6 +25,32 @@ Rules:
 - Keep the library entry file name aligned with the provided feature.
   Example: =src/nelisp-json.el= must continue to =(provide 'nelisp-json)=.
 - Keep ERT coverage beside the package in =test/=.
+- Keep =packages/<name>/manifest.el= in step with the code:
+
+  #+begin_src elisp
+  (:name "nelisp-http"
+   :requires ("nelisp-process" "nelisp-state" "nelisp-sys"))
+  #+end_src
+
+  =:requires= names packages, not features; host libraries such as
+  =cl-lib= are not listed.  Every package has one, and =make pkg-graph=
+  fails when a manifest and the code disagree — so adding a cross-package
+  =require= means updating the manifest, which is one command:
+
+  #+begin_src sh
+  make pkg-manifest-update PKG=<name>
+  #+end_src
+
+  =:version= is optional; nothing consumes one yet.  See
+  =packages/nelisp-pkg/README.org=.
+- Claim a namespace prefix and stay inside it.  Elisp has one obarray,
+  so a second definition of a name silently wins; =packages/nl-ns/=
+  reports definitions outside their file's prefix, references to another
+  file's =--= private names, cross-file references with no =require=,
+  and host definitions shadowed without an =fboundp= guard.  Check a
+  package with =tools/ai/nelisp-ai.sh ns packages/<name>/src/*.el=, and
+  the tree with =make ns-inventory= (ratcheted to a baseline, so the
+  count may not grow).
 - Do not rewrite callers when extracting a package.  Existing
   =(require 'feature)= forms should continue to resolve through the
   build's load-path.
@@ -63,3 +89,23 @@ rules.
 
 =packages/nelisp-json/= is the pilot extraction.  Doc 45 can reference
 it as the canonical example for future library moves.
+
+* The nl-* extension family (Doc 168)
+
+=nl-prelude= / =nl-condition= / =nl-safe= / =nl-contract= /
+=nl-check= / =nl-ns= are opt-in LANGUAGE extension libraries
+(Doc 168-170), not extractions from the core: they never ship
+loaded, and the root Makefile globs both the
+=nelisp-*= and =nl-*= name families for compile and test.  Each
+follows the same layout as above plus a
+=test/<name>-standalone-smoke.el= runner that executes the identical
+ERT bodies on =target/nelisp= (which has no ert) through a minimal
+shim -- copy that pattern for new nl-* packages.
+
+=nl-check= and =nl-ns= are the exceptions to the dependency rule: they
+are checking passes (Doc 170 section 10; Doc 169 defect #6), so they
+depend on the feature packages and *nothing depends on them*.  Keep
+that arrow one-way; the point is that a checker can always be deleted.
+=nl-check= reads one form at a time (must-use, resource linearity,
+unsafe calls); =nl-ns= reads a whole file set at once (cross-file name
+collisions, stray definitions, private-boundary references).

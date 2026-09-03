@@ -5,7 +5,7 @@
 ;; dispatch arm, so calling it aborted the caller via the combiner's
 ;; deferred-apply stash.  This audit mechanically detects that whole bug
 ;; class: every name whose fboundp-truth comes from the builtin name list
-;; MUST have a matching `(:lit "NAME")' / `(:u8 "NAME")' dispatch arm.
+;; MUST occur in the dispatch table the reader builder actually returns.
 ;;
 ;; Usage:  emacs --batch -Q -L lisp -L src -L scripts \
 ;;           -l reader-surface-audit -f nelisp-reader-surface-audit
@@ -18,19 +18,39 @@
 
 (require 'nelisp-standalone-build)
 
+(defconst nelisp-reader-surface-audit--targets
+  '(linux-x86_64 linux-aarch64 macos-aarch64 windows-x86_64)
+  "Release targets whose reader dispatch tables this audit checks.")
+
+(defun nelisp-reader-surface-audit--target-dispatch-names (target)
+  "Return the names in the reader dispatch table built for TARGET."
+  (let ((nelisp-standalone--target target))
+    (mapcar
+     (lambda (arm)
+       (let ((key (car arm)))
+         (unless (and (consp key)
+                      (memq (car key) '(:lit :u8))
+                      (stringp (cadr key)))
+           (error "Malformed reader dispatch arm for %s: %S" target arm))
+         (cadr key)))
+     (nelisp-standalone--applyfn-reader-table))))
+
 (defun nelisp-reader-surface-audit--dispatch-names ()
-  "Return every dispatch-arm name ((:lit \"X\") / (:u8 \"X\")) in the build script."
-  (let ((file (locate-library "nelisp-standalone-build.el"))
-        (names nil))
-    (unless file
-      (setq file (expand-file-name "nelisp-standalone-build.el"
-                                   (file-name-directory load-file-name))))
-    (with-temp-buffer
-      (insert-file-contents file)
-      (goto-char (point-min))
-      (while (re-search-forward "((:\\(?:lit\\|u8\\) \"\\([^\"]+\\)\")" nil t)
-        (push (match-string 1) names)))
-    names))
+  "Return names with a dispatch arm on every release target.
+
+Ask the final reader-table builder instead of scanning its source spelling.
+That makes literal, `cons'-built, and future computed arms indistinguishable,
+so changing how an arm is constructed cannot make this audit rot.  Build all
+release-target variants rather than trusting the host/default target; a name
+missing from even one target is absent from the returned intersection."
+  (let ((tables
+         (mapcar #'nelisp-reader-surface-audit--target-dispatch-names
+                 nelisp-reader-surface-audit--targets)))
+    (cl-reduce
+     (lambda (common names)
+       (cl-remove-if-not (lambda (name) (member name names)) common))
+     (cdr tables)
+     :initial-value (car tables))))
 
 (defconst nelisp-reader-surface-audit--combiner-handled
   '("eval" "funcall" "apply" "fset" "symbol-function"
@@ -71,6 +91,12 @@ these; prefer the dispatch-armed equivalents (e.g.
                    (length nelisp-reader-surface-audit--combiner-deferred)))
     (dolist (name nelisp-reader-surface-audit--combiner-deferred)
       (princ (format "    %s\n" name)))
+    ;; Machine-readable tail, before the verdict so it survives both
+    ;; exit paths.  `claimed' is the population this audit is about: if
+    ;; `nelisp-standalone--reader-builtins' were ever empty the audit
+    ;; would print PASS having compared nothing.  See tools/ai/README.md.
+    (princ (format "GATE-COUNT checked=%d findings=%d\n"
+                   (length claimed) (length liars)))
     (if (null liars)
         (princ "  PASS: every claimed builtin has a dispatch arm\n")
       (princ (format "  FAIL: %d fboundp-liar builtin(s) — fboundp t, call aborts:\n"

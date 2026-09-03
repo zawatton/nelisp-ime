@@ -1,0 +1,138 @@
+#+TITLE: Recipe — stdio service
+
+* Shape
+
+A NeLisp process driven by a host program over a pipe: one
+s-expression request per line on stdin, one s-expression response per
+line on stdout.  The host owns the lifetime, the window, the tray icon,
+the socket — whatever it is that must be native — and NeLisp owns the
+logic.
+
+This is the shape with the most production evidence behind it in this
+codebase: a Windows IME service drives its NeLisp engine exactly this
+way, at a measured 15–38 ms per keystroke round trip including
+transport.
+
+* Run
+
+#+begin_src sh
+printf '(ping 1)\n(add 2 40)\n(quit)\n' | nelisp --load skeleton/service.el
+#+end_src
+
+#+begin_example
+(pong 1)
+(sum 42)
+(bye)
+service-eof
+#+end_example
+
+* Verify first
+
+#+begin_src sh
+recipes/stdio-service/verify.sh
+#+end_src
+
+Four checks, of which the fourth is the one that decides whether this
+shape works at all for an interactive host: responses must be flushed as
+they are produced, not buffered until exit.  The smoke holds the pipe
+open for four seconds and requires the first response to be on disk two
+seconds in.  It passes on this tree — 9 bytes at t=2s.
+
+* What it needs
+
+- =read-stdin-bytes=, =string-search=, =read-from-string=, =prin1=,
+  =terpri= — all present in the standalone runtime.
+- Nothing from =packages/=.
+
+* What it cannot do
+
+- *Long uptime is not free, and the budget is measurable.*  The arena
+  does not reclaim, so the question is how many requests fit before the
+  process has to be restarted.  Ask this service:
+
+  #+begin_src sh
+  recipes/stdio-service/measure.sh
+  #+end_src
+
+  Measured 2026-08-18 on the same commit, sending `(ping N)':
+
+  | host              | 10 req  | 110 req | 210 req | shape                        |
+  |-------------------+---------+---------+---------+------------------------------|
+  | WSL Debian x86_64 | 12.3 MB | 132 MB  | 243 MB  | linear, ~1.15 MB per request |
+  | Windows x86_64    | 12.3 MB | 42.1 MB | 42.0 MB | plateaus near 42 MB          |
+
+  On Linux that is roughly *900 requests per gigabyte*, so supervision
+  and a restart threshold are not optional.  On Windows the growth
+  stopped inside the measured range, which is a different operating
+  posture entirely — and the difference is the reason the recipe ships a
+  measurement rather than a rule of thumb.
+
+  The script takes three counts rather than two: the Windows slope
+  between 10 and 110 requests reads 297 KB per request and between 110
+  and 210 reads *below zero*, so a two-point measurement would have
+  published a rate that does not exist.
+- *No JSON out of the box.*  Framing is s-expressions because
+  =read-from-string= is in the runtime and =json-encode= is not.  If the
+  host must speak JSON, load =packages/nelisp-json= and pay for it
+  deliberately.
+- *Lines, not arbitrary payloads.*  A request containing a newline needs
+  a length prefix instead.  Change =service-next-line=; nothing else in
+  the skeleton cares.
+
+* Where to cut
+
+=service-handle= is the only function you are meant to replace.
+Everything above it is transport and everything below it is the loop.
+
+* Adopting nl-safe: the request buffer under a borrow
+
+=skeleton/service-checked.el= is the same service with one change: the
+bytes read but not yet parsed live in a borrow cell instead of a plain
+variable.  That buffer is the aliasing shape in miniature — one function
+appends to it, another consumes from it, and nothing in the plain
+version says which owns it at any moment.
+
+#+begin_src elisp
+(nl-defcell service-checked-pending (vector ""))
+
+(nl-with-borrow-mut (slot service-checked-pending)   ; fill and split together
+  ...)
+(nl-with-borrow (slot service-checked-pending)       ; read the length
+  (length (aref slot 0)))
+#+end_src
+
+It ships as a second file so the recipe can be measured both ways.
+
+** Granularity is the whole finding
+
+One borrow is taken per *line read*, covering fill-and-scan together —
+not one per =read-stdin-bytes= call and not one per access.  That choice
+is what the cost turns on:
+
+| measurement                                   | ratio    |
+|-----------------------------------------------+----------|
+| =make nl-safe-bench=: one borrow vs one unchecked read | *46.60x* |
+| this service, 200 requests, Windows x86_64    | *1.04x*  |
+| this service, 200 requests, WSL Debian        | *0.98x*  |
+
+Both service figures come from =tools/ai/bench-compare.sh= with
+noise/signal at 0.01 and 0.08.  Arena use did not rise either; on
+Windows the checked variant used *less* (13.6 MB against 42.1 MB at 110
+requests, both plateaued).
+
+So the question "can we afford nl-safe" is really "where are the
+boundaries of a unit of work".  Per access it is unaffordable; per
+request it is inside the noise.
+
+** Proving the checks are live
+
+A service whose borrows are all legal looks exactly like a service with
+no checks in it.  =(conflict)= is a request that deliberately takes an
+exclusive borrow while a shared one is held; =verify.sh= requires the
+answer =(conflict signalled)=.  Keep an equivalent in anything you
+adapt.
+
+#+begin_src sh
+recipes/stdio-service/measure.sh 10 110 210 service-checked
+sh recipes/stdio-service/arm.sh service-checked 200
+#+end_src
