@@ -202,6 +202,23 @@
 # ERT never loads it -- nelisp-regexp-split-string-matches-host was red on
 # main because of exactly that).  Same body in both files; the bootstrap-copy
 # shape every other pinned prelude collision here has.
+#
+# 945 -> 960 and 724 -> 726 on 2026-09-04, nelisp-ime fork.  This tree
+# carries the IME framework on top of the runtime, and its public API is
+# counted the same way the 848 above is: 13 names across
+# packages/nelisp-ime-lattice/src/nelisp-ime-lattice.el
+# (nelisp-ime-dictionary-*, nelisp-ime-lattice-*, nelisp-ime-infinity,
+# nelisp-ime-system-candidates, nelisp-ime-unknown-cost),
+# packages/nelisp-ime/src/nelisp-ime-protocol.el and
+# nelisp-ime-stateline.el (dispatch / version / handle-json), plus the two
+# encode-cache variables the IME added to packages/nelisp-json/src/
+# nelisp-json.el.  The two private escapes are
+# nelisp-ime--candidate-normalize, which the lattice engine calls from its
+# own package, and nelisp-ime--apply-mark, which the STATE-line layer
+# calls; promoting them is an API change for the framework and the
+# submodule, so they are conceded here with the reason rather than
+# renamed in passing.  Measured with `make ns-inventory' on the tree that
+# merged NeLisp v1.2.0; CI reported the same 960 / 726 on cd8e8a28.
 ns-collision 246
 # 97 -> 96 on 2026-08-19: `string-equal' no longer differs between the two
 # files -- the prelude's now signals for a non-string instead of falling
@@ -570,7 +587,7 @@ ns-collision-divergent 126
 # only hosted Emacs takes this one -- so it cannot be renamed into the file's
 # own prefix without defeating the guard.  A deliberate one-name exception,
 # not a drift.
-ns-prefix-violation 945
+ns-prefix-violation 960
 # 611 -> 613 on 2026-08-20: `nelisp--check-string'/`--check-symbol' and the
 # other argument-check helpers are referenced from the lisp/ mirrors that
 # carry copies of the functions using them.  This is the kind this file
@@ -679,7 +696,7 @@ ns-prefix-violation 945
 # reconcile to the measured tree so the collision identity gate can run.
 # 725 -> 724 on 2026-09-03: ratcheted down to the measured value (the gate
 # reported it one below baseline).
-ns-private-escape 724
+ns-private-escape 726
 ns-unreadable 0
 
 # `pinned-collision KEY' pins every ns-collision and ns-collision-divergent
