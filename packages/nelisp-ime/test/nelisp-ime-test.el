@@ -396,6 +396,31 @@
       (should (equal (plist-get result :candidates) []))
       (should (equal (plist-get result :segments) [])))))
 
+(ert-deftest nelisp-ime-test-compact-survives-commit-and-reset ()
+  ;; A compact session that commits, or resynchronizes, stayed compact only
+  ;; until it did so once: both paths rebuilt the session without `detail',
+  ;; and every later keystroke paid for the candidate and segment lists it
+  ;; had asked not to receive.  Measured on the standalone runtime at
+  ;; 742 ms per keystroke against 312 ms compact.
+  (nelisp-ime-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸" "端")))
+    (nelisp-ime-session-open "s" '(:detail compact))
+    (nelisp-ime-feed "s" '(:op :insert :text "はし"))
+    (nelisp-ime-feed "s" '(:op :commit))
+    (let ((after-commit (nelisp-ime-feed "s" '(:op :insert :text "はし"))))
+      (should (equal (plist-get after-commit :candidates) []))
+      (should (equal (plist-get after-commit :segments) [])))
+    (nelisp-ime-session-reset "s")
+    (let ((after-reset (nelisp-ime-feed "s" '(:op :insert :text "はし"))))
+      (should (equal (plist-get after-reset :candidates) []))
+      (should (equal (plist-get after-reset :segments) [])))
+    ;; A full session is not quietly turned compact by the same paths.
+    (nelisp-ime-session-open "f" '(:input-style kana))
+    (nelisp-ime-feed "f" '(:op :insert :text "はし"))
+    (nelisp-ime-feed "f" '(:op :commit))
+    (let ((after-commit (nelisp-ime-feed "f" '(:op :insert :text "はし"))))
+      (should (> (length (plist-get after-commit :candidates)) 0)))))
+
 (ert-deftest nelisp-ime-test-compact-session-answers-selection-in-full ()
   (nelisp-ime-test--isolated
     (setq nelisp-ime-dictionary '(("はし" "橋" "箸" "端")))

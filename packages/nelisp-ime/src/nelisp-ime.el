@@ -615,6 +615,10 @@ session; omitting it defers to `nelisp-ime-converter-function' and then
                      :input-style (plist-get session :input-style)
                      :context (plist-get session :context)
                      :engine (plist-get session :engine)
+                     ;; `detail' survives a commit.  It did not, and a
+                     ;; compact session silently became a full one at its
+                     ;; first commit -- the ordinary path, not an edge case.
+                     :detail (plist-get session :detail)
                      :reading "" :pending "" :preedit "" :segments nil
                      :candidates nil :active-segment 0 :candidate-index 0)))
     (when commit-p
@@ -697,7 +701,7 @@ of the error propagating to the adapter."
 Adapters call this to resynchronize after the application terminated a
 composition behind the engine's back, or after an IPC timeout left the two
 sides disagreeing.  Unlike `nelisp-ime-session-close' the session stays
-open with its input style, context, and engine intact."
+open with its input style, context, engine, and snapshot detail intact."
   (let* ((session (nelisp-ime--session session-id))
          (engine (nelisp-ime--session-engine session))
          (reset (and engine (plist-get engine :reset)))
@@ -705,6 +709,10 @@ open with its input style, context, and engine intact."
                       :input-style (plist-get session :input-style)
                       :context (plist-get session :context)
                       :engine (plist-get session :engine)
+                      ;; And a resynchronization keeps it too: an adapter
+                      ;; that resets after an IPC timeout was paying for
+                      ;; full snapshots from then on.
+                      :detail (plist-get session :detail)
                       :reading "" :pending "" :preedit "" :segments nil
                       :candidates nil :active-segment 0 :candidate-index 0)))
     (when reset (funcall reset session-id session))
