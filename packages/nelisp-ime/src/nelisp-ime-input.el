@@ -108,14 +108,48 @@
   (or (and shift (cdr (assoc code nelisp-ime-jis-kana-shift-map)))
       (cdr (assoc code nelisp-ime-jis-kana-map))))
 
+(defvar nelisp-ime--romaji-index nil
+  "Lookup tables derived from `nelisp-ime-romaji-map'.
+A cons of the map they were built from and (EXACT . PREFIXES), so
+replacing the map rebuilds them and a custom table needs no extra call.
+
+They exist because both lookups on the keystroke path were linear over
+the map.  Asking whether a pending string begins any rule walked all 132
+of them with a `string-prefix-p' each, and the step function asks twice
+per key; the exact lookup was an `assoc' over the same list.  Measured on
+the standalone runtime that was 51 ms per keystroke, more than the
+lattice conversion and the snapshot together.
+
+A map mutated in place rather than replaced is not noticed, which is the
+same contract the candidate caches keep.")
+
+(defun nelisp-ime--romaji-tables ()
+  "Return (EXACT . PREFIXES) for `nelisp-ime-romaji-map'.
+EXACT maps a full romanization to its kana, PREFIXES holds every proper
+prefix of every rule, so both questions the step function asks are one
+hash lookup."
+  (unless (and nelisp-ime--romaji-index
+               (eq (car nelisp-ime--romaji-index) nelisp-ime-romaji-map))
+    (let ((exact (make-hash-table :test 'equal))
+          (prefixes (make-hash-table :test 'equal)))
+      (dolist (rule nelisp-ime-romaji-map)
+        (puthash (car rule) (cdr rule) exact)
+        (let ((key (car rule))
+              (index 1))
+          (while (<= index (length key))
+            (puthash (substring key 0 index) t prefixes)
+            (setq index (1+ index)))))
+      (setq nelisp-ime--romaji-index
+            (cons nelisp-ime-romaji-map (cons exact prefixes)))))
+  (cdr nelisp-ime--romaji-index))
+
+(defun nelisp-ime--romaji-exact (pending)
+  "Return the kana PENDING spells outright, or nil."
+  (gethash pending (car (nelisp-ime--romaji-tables))))
+
 (defun nelisp-ime--romaji-prefix-p (pending)
   "Return non-nil when PENDING begins at least one romanization rule."
-  (let ((rules nelisp-ime-romaji-map)
-        found)
-    (while (and rules (not found))
-      (when (string-prefix-p pending (caar rules)) (setq found t))
-      (setq rules (cdr rules)))
-    found))
+  (and (gethash pending (cdr (nelisp-ime--romaji-tables))) t))
 
 (defun nelisp-ime-romaji-step (pending key)
   "Consume roman KEY after PENDING and return (:text TEXT :pending REST)."
@@ -126,7 +160,7 @@
                (not (memq (aref next 0) '(?a ?i ?u ?e ?o ?n))))
       (setq emitted "っ"
             next (substring next 1)))
-    (let ((exact (cdr (assoc next nelisp-ime-romaji-map))))
+    (let ((exact (nelisp-ime--romaji-exact next)))
       (cond
        ((and exact (not (nelisp-ime--romaji-prefix-p
                          (concat next "a"))))
