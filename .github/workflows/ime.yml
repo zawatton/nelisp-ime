@@ -5,12 +5,22 @@ on:
   push:
     paths:
       - 'packages/nelisp-ime/**'
+      # The lattice engine is a submodule, so a change to it reaches this
+      # repository as a pointer update under this path and nothing else.
+      # Without the line, changing the conversion engine -- the thing the
+      # smokes exist to test -- ran no job at all.
+      - 'packages/nelisp-ime-lattice'
       - 'packages/nelisp-json/**'
       - 'platform/**'
       - '.github/workflows/ime.yml'
   pull_request:
     paths:
       - 'packages/nelisp-ime/**'
+      # The lattice engine is a submodule, so a change to it reaches this
+      # repository as a pointer update under this path and nothing else.
+      # Without the line, changing the conversion engine -- the thing the
+      # smokes exist to test -- ran no job at all.
+      - 'packages/nelisp-ime-lattice'
       - 'packages/nelisp-json/**'
       - 'platform/**'
       - '.github/workflows/ime.yml'
