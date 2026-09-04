@@ -191,6 +191,19 @@ gloss beside the surface, so it must not be flattened away."
   "Return an unambiguous learning key for READING and SURFACE."
   (cons reading surface))
 
+(defvar nelisp-ime-learning-generation 0
+  "Bumped whenever the learning table changes.
+
+An engine may cache work derived from the table -- the lattice caches a
+whole dynamic-programming pass over the reading being typed -- and needs
+to know when that work stopped being valid.  Counting the table's rows
+cannot answer it: a commit that raises an existing pair's count changes
+every cost the engine derived from it while leaving the row count alone.")
+
+(defun nelisp-ime--learning-touched ()
+  "Record that the learning table changed."
+  (setq nelisp-ime-learning-generation (1+ nelisp-ime-learning-generation)))
+
 (defun nelisp-ime-learning-count (reading surface)
   "Return learned selection count for READING and SURFACE."
   (or (gethash (nelisp-ime--learning-key reading surface)
@@ -207,6 +220,7 @@ gloss beside the surface, so it must not be flattened away."
       (when key
         (puthash key (1+ (or (gethash key nelisp-ime-learning) 0))
                  nelisp-ime-learning)
+        (nelisp-ime--learning-touched)
         (nelisp-ime-learning-journal-append reading surface)))))
 
 (defun nelisp-ime-learning-export ()
@@ -235,6 +249,7 @@ gloss beside the surface, so it must not be flattened away."
       (puthash (nelisp-ime--learning-key (nth 0 row) (nth 1 row))
                (nth 2 row) table))
     (setq nelisp-ime-learning table)
+    (nelisp-ime--learning-touched)
     (hash-table-count table)))
 
 ;;;###autoload
@@ -330,6 +345,7 @@ lost."
                                                        (nth 1 entry))))
                     (puthash key (1+ (or (gethash key nelisp-ime-learning) 0))
                              nelisp-ime-learning)
+                    (nelisp-ime--learning-touched)
                     (setq replayed (1+ replayed)))))))
           (forward-line 1))))
     replayed))
