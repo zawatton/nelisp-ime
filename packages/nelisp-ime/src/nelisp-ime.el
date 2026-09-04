@@ -425,13 +425,22 @@ the adapter needs the list it is selecting from.  The default stays
       'compact))
 
 (defun nelisp-ime--candidate-vector (candidates)
-  "Return CANDIDATES as a vector truncated to `nelisp-ime-candidate-limit'."
+  "Return CANDIDATES as a vector truncated to `nelisp-ime-candidate-limit'.
+
+Walks the list once.  It used to call `nth' for each index, which walks
+from the head every time, so truncating one segment's candidates cost
+`limit' squared cdr steps -- and a snapshot does it for every segment, on
+every keystroke.  Measured on the standalone runtime with a five-segment
+composition whose first segment carries 95 candidates, that was 71 ms of
+a 91 ms full snapshot."
   (let ((limit nelisp-ime-candidate-limit))
     (if (and limit (> (length candidates) limit))
         (let ((vector (make-vector limit nil))
-              (index 0))
+              (index 0)
+              (rest candidates))
           (while (< index limit)
-            (aset vector index (nth index candidates))
+            (aset vector index (car rest))
+            (setq rest (cdr rest))
             (setq index (1+ index)))
           vector)
       (vconcat candidates))))
