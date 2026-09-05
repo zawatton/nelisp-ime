@@ -10,6 +10,10 @@
   `(let ((nelisp-ime-sessions (make-hash-table :test 'equal))
          (nelisp-ime-learning (make-hash-table :test 'equal))
          (nelisp-ime-dictionary nil)
+         ;; Hex encoding is a pure function, so a carried-over entry cannot
+         ;; produce a wrong line -- but a test that counts entries would see
+         ;; the previous test's.
+         (nelisp-ime-stateline--candidate-hex (make-hash-table :test 'equal))
          (nelisp-ime-converter-function #'nelisp-ime-dictionary-convert))
      ,@body))
 
@@ -122,6 +126,67 @@
       ;; With fail-open disabled the engine signals; the protocol must still
       ;; answer a line rather than propagate.
       (should (equal (nelisp-ime-stateline-dispatch "KEY 97") "ERR INTERNAL")))))
+
+(defun nelisp-ime-stateline-test--candidates-uncached (snapshot)
+  "Build SNAPSHOT's candidate field without consulting the cache."
+  (let ((candidates (plist-get snapshot :candidates)))
+    (if (or (null candidates) (= (length candidates) 0))
+        "-"
+      (let ((parts nil) (index (1- (length candidates))))
+        (while (>= index 0)
+          (push (nelisp-ime-stateline--hex (aref candidates index)) parts)
+          (setq index (1- index)))
+        (mapconcat #'identity parts ",")))))
+
+(ert-deftest nelisp-ime-stateline-test-candidate-hex-cache-matches-uncached ()
+  "The cached candidate field is the field an uncached encoder builds.
+The cache exists to skip work, so the only thing that matters about it is
+that skipping the work changes nothing on the wire."
+  (nelisp-ime-stateline-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸" "端")))
+    (nelisp-ime-session-open "s")
+    (let ((snapshot (nelisp-ime-feed "s" '(:op :insert :text "はし"))))
+      ;; Twice: the first call fills the cache, the second reads it, and both
+      ;; must agree with the uncached build.
+      (should (equal (nelisp-ime-stateline--candidates snapshot)
+                     (nelisp-ime-stateline-test--candidates-uncached snapshot)))
+      (should (equal (nelisp-ime-stateline--candidates snapshot)
+                     (nelisp-ime-stateline-test--candidates-uncached snapshot))))))
+
+(ert-deftest nelisp-ime-stateline-test-candidate-hex-cache-is-consulted ()
+  "The cache is actually read, so the agreement test above is not vacuous.
+Poisoning one entry must change the field: if the encoder ignored the
+cache, this would pass unchanged and the test above would be proving
+nothing about the cache at all."
+  (nelisp-ime-stateline-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸")))
+    (nelisp-ime-session-open "s")
+    (let* ((snapshot (nelisp-ime-feed "s" '(:op :insert :text "はし")))
+           (honest (nelisp-ime-stateline--candidates snapshot)))
+      (should (> (hash-table-count nelisp-ime-stateline--candidate-hex) 0))
+      (puthash "橋" "poisoned" nelisp-ime-stateline--candidate-hex)
+      (should-not (equal (nelisp-ime-stateline--candidates snapshot) honest))
+      ;; And clearing it restores the honest answer, which is what
+      ;; `nelisp-ime-stateline-cache-clear' is for.
+      (nelisp-ime-stateline-cache-clear)
+      (should (= (hash-table-count nelisp-ime-stateline--candidate-hex) 0))
+      (should (equal (nelisp-ime-stateline--candidates snapshot) honest)))))
+
+(ert-deftest nelisp-ime-stateline-test-candidate-hex-cache-keyed-per-surface ()
+  "Two surfaces sharing no prefix get their own entries.
+A cache keyed by anything coarser than the surface -- the segment, the
+reading, the index -- would answer one surface with another's hex."
+  (nelisp-ime-stateline-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸")))
+    (nelisp-ime-session-open "s")
+    (nelisp-ime-stateline--candidates
+     (nelisp-ime-feed "s" '(:op :insert :text "はし")))
+    (should (equal (gethash "橋" nelisp-ime-stateline--candidate-hex)
+                   (nelisp-ime-stateline--hex "橋")))
+    (should (equal (gethash "箸" nelisp-ime-stateline--candidate-hex)
+                   (nelisp-ime-stateline--hex "箸")))
+    (should-not (equal (gethash "橋" nelisp-ime-stateline--candidate-hex)
+                       (gethash "箸" nelisp-ime-stateline--candidate-hex)))))
 
 (provide 'nelisp-ime-stateline-test)
 ;;; nelisp-ime-stateline-test.el ends here

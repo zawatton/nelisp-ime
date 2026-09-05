@@ -95,6 +95,30 @@ call, so the shape of this loop is most of the per-key budget."
           (setq offset (+ offset 6)))
         out))))
 
+(defvar nelisp-ime-stateline--candidate-hex (make-hash-table :test 'equal)
+  "Hex encodings of candidate surfaces, keyed by the surface.
+
+Hex encoding is a pure function of its argument, so this cannot go stale.
+The encoder is already preallocated and `aset'-based and there is nothing
+left to remove from it -- the cost is the number of interpreted operations
+it runs, six `aset's and their arithmetic per character, thirty candidates
+deep, on every keystroke.  Not running it is the only saving left.
+
+Worth caching because the same surfaces come back: over one phrase 480
+calls resolve to 77 distinct arguments, over five phrases 2400 to the same
+77, and a second unrelated phrase takes it to 111.  Between 83% and 96% of
+calls are repeats.
+
+The key space is the dictionary's surfaces rather than anything the user
+types, which is why the preedit and pending fields are NOT cached here:
+those are unbounded in a long session, and they are two calls a keystroke
+against thirty.  Cleared by `nelisp-ime-stateline-cache-clear'.")
+
+(defun nelisp-ime-stateline-cache-clear ()
+  "Forget every cached candidate hex encoding."
+  (clrhash nelisp-ime-stateline--candidate-hex)
+  nil)
+
 (defun nelisp-ime-stateline--candidates (snapshot)
   "Return SNAPSHOT's candidates as one comma-separated hex field."
   (let ((candidates (plist-get snapshot :candidates)))
@@ -103,7 +127,12 @@ call, so the shape of this loop is most of the per-key budget."
       (let ((parts nil)
             (index (1- (length candidates))))
         (while (>= index 0)
-          (push (nelisp-ime-stateline--hex (aref candidates index)) parts)
+          (let* ((surface (aref candidates index))
+                 (hex (gethash surface nelisp-ime-stateline--candidate-hex)))
+            (unless hex
+              (setq hex (nelisp-ime-stateline--hex surface))
+              (puthash surface hex nelisp-ime-stateline--candidate-hex))
+            (push hex parts))
           (setq index (1- index)))
         (mapconcat #'identity parts ",")))))
 
