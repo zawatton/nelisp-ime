@@ -484,5 +484,42 @@ the same defect `nelisp-ime--finish' records for commits."
     (let ((after (nelisp-ime-feed "s" '(:op :insert :text "はし"))))
       (should-not (equal (plist-get after :candidates) [])))))
 
+(ert-deftest nelisp-ime-test-candidates-only-drops-segments-keeps-candidates ()
+  "`candidates-only' is the level between `full' and `compact'.
+It exists for a reader that shows candidates inline and never asks for the
+breakdown, so the two halves are asserted separately: dropping segments is
+the point, and keeping candidates is what distinguishes it from compact."
+  (nelisp-ime-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸") ("を" "を") ("わたる" "渡る")))
+    (nelisp-ime-session-open "s" '(:detail candidates-only))
+    (let ((snapshot (nelisp-ime-feed "s" '(:op :insert :text "はしをわたる"))))
+      (should (equal (plist-get snapshot :segments) []))
+      (should-not (equal (plist-get snapshot :candidates) []))
+      ;; The fields a reader at this level does use are all still there.
+      (should (stringp (plist-get snapshot :preedit)))
+      (should (stringp (plist-get snapshot :mode)))
+      (should (integerp (plist-get snapshot :cursor)))
+      (should (integerp (plist-get snapshot :composition-start))))))
+
+(ert-deftest nelisp-ime-test-detail-levels-are-distinct ()
+  "The three levels differ from each other, in both fields.
+Written as one table so a level that silently collapsed into another --
+which is what adding a third one risks -- fails here rather than in a
+performance measurement much later."
+  (nelisp-ime-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸")))
+    (dolist (case '((full            populated populated)
+                    (candidates-only  empty     populated)
+                    (compact          empty     empty)))
+      (let* ((level (nth 0 case))
+             (id (symbol-name level)))
+        (nelisp-ime-session-open id (list :detail level))
+        (let* ((snapshot (nelisp-ime-feed id '(:op :insert :text "はし")))
+               (segments (if (equal (plist-get snapshot :segments) [])
+                             'empty 'populated))
+               (candidates (if (equal (plist-get snapshot :candidates) [])
+                               'empty 'populated)))
+          (should (equal (list level segments candidates) case)))))))
+
 (provide 'nelisp-ime-test)
 ;;; nelisp-ime-test.el ends here

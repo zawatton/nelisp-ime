@@ -155,8 +155,13 @@ per `concat' argument."
   "Return the protocol's session, opening it when absent."
   (or (gethash nelisp-ime-stateline--session-id nelisp-ime-sessions)
       (progn
+        ;; This protocol reads :mode :cursor :composition-start :preedit
+        ;; :pending :candidate-index and :candidates, and never :segments --
+        ;; so it asks for a snapshot without one.  See
+        ;; `nelisp-ime-snapshot-detail' for what building it costs.
         (nelisp-ime-session-open nelisp-ime-stateline--session-id
-                                 '(:input-style romaji))
+                                 '(:input-style romaji
+                                   :detail candidates-only))
         (gethash nelisp-ime-stateline--session-id nelisp-ime-sessions))))
 
 (defun nelisp-ime-stateline--feed (event)

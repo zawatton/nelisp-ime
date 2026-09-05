@@ -82,5 +82,15 @@
       (should (vectorp (gethash "candidates" result)))
       (should (vectorp (gethash "candidates" (aref segments 0)))))))
 
+(ert-deftest nelisp-ime-protocol-test-detail-accepts-candidates-only ()
+  "The wire spelling of every detail level round-trips, and no other does."
+  (should (eq (nelisp-ime-protocol--detail "full") 'full))
+  (should (eq (nelisp-ime-protocol--detail "compact") 'compact))
+  (should (eq (nelisp-ime-protocol--detail "candidates-only") 'candidates-only))
+  (should (null (nelisp-ime-protocol--detail nil)))
+  ;; An unknown level is an error rather than a silent `full'.
+  (should-error (nelisp-ime-protocol--detail "candidates_only"))
+  (should-error (nelisp-ime-protocol--detail "brief")))
+
 (provide 'nelisp-ime-protocol-test)
 ;;; nelisp-ime-protocol-test.el ends here

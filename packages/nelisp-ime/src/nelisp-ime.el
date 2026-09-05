@@ -404,25 +404,46 @@ fewer, so snapshots truncate.  Selection operations index into the
 truncated list the adapter received, so they stay consistent.")
 
 (defvar nelisp-ime-snapshot-detail 'full
-  "How much of the composition a snapshot carries: `full' or `compact'.
+  "How much of the composition a snapshot carries.
 
-A compact snapshot omits the candidate lists and the segment breakdown,
-keeping the reading, preedit, mode, and cursor an adapter needs to paint
-the composition.  It exists because encoding cost tracks payload size:
-one full snapshot of a sentence is ~1078 characters, and the standalone
-runtime charges roughly a millisecond per character to encode.
+`full'             candidate lists and the segment breakdown.
+`candidates-only'  candidate lists, no segment breakdown.
+`compact'          neither.
+
+A compact snapshot keeps the reading, preedit, mode, and cursor an adapter
+needs to paint the composition.  It exists because encoding cost tracks
+payload size: one full snapshot of a sentence is ~1078 characters, and the
+standalone runtime charges roughly a millisecond per character to encode.
+
+`candidates-only' exists for an adapter that shows candidates inline and
+never needs the breakdown -- the STATE line protocol is exactly that, and
+reads neither `:segments' nor anything derived from it.  Building the
+field for it is not free: measured on the standalone runtime with a
+five-segment composition, `:segments' is 81956 of the snapshot's 113721
+allocations, because every segment plist is copied and its candidate list
+turned into a vector, on every keystroke.  That is ~40% of a keystroke
+spent on a field its reader discards.
 
 Adapters that only open a candidate window on demand should run sessions
 compact and ask for a full snapshot with `nelisp-ime-session-status' when
 the window opens.  Selection operations always answer in full, because
-the adapter needs the list it is selecting from.  The default stays
-`full' so existing adapters keep working unchanged.")
+the adapter needs the list it is selecting from, and the session's own
+level is put back afterwards.  The default stays `full' so existing
+adapters keep working unchanged.")
+
+(defun nelisp-ime--detail (&optional session)
+  "Return the snapshot detail in force for SESSION."
+  (or (and session (plist-get session :detail))
+      nelisp-ime-snapshot-detail))
 
 (defun nelisp-ime--compact-p (&optional session)
-  "Return non-nil when SESSION's snapshots omit candidates and segments."
-  (eq (or (and session (plist-get session :detail))
-          nelisp-ime-snapshot-detail)
-      'compact))
+  "Return non-nil when SESSION's snapshots omit the candidate lists."
+  (eq (nelisp-ime--detail session) 'compact))
+
+(defun nelisp-ime--segments-omitted-p (&optional session)
+  "Return non-nil when SESSION's snapshots omit the segment breakdown.
+Both `compact' and `candidates-only' do; they differ over candidates."
+  (memq (nelisp-ime--detail session) '(compact candidates-only)))
 
 (defun nelisp-ime--candidate-vector (candidates)
   "Return CANDIDATES as a vector truncated to `nelisp-ime-candidate-limit'.
@@ -482,7 +503,7 @@ non-modal engine's mode indicator should show anyway."
           :cursor (length preedit)
           :composition-start (if composing 0 -1)
           :segments
-          (if (nelisp-ime--compact-p session)
+          (if (nelisp-ime--segments-omitted-p session)
               []
             (vconcat
              (mapcar (lambda (segment)

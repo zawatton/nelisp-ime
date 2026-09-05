@@ -188,5 +188,23 @@ reading, the index -- would answer one surface with another's hex."
     (should-not (equal (gethash "橋" nelisp-ime-stateline--candidate-hex)
                        (gethash "箸" nelisp-ime-stateline--candidate-hex)))))
 
+(ert-deftest nelisp-ime-stateline-test-session-omits-the-segments-it-never-reads ()
+  "The protocol's own session runs at `candidates-only'.
+This file reads :mode :cursor :composition-start :preedit :pending
+:candidate-index and :candidates, and never :segments -- building it was
+~40% of a keystroke.  Asserted on the session the protocol opens for
+itself, because that is the one the Windows host drives."
+  (nelisp-ime-stateline-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸")))
+    (nelisp-ime-stateline-dispatch "RESET")
+    (nelisp-ime-stateline-dispatch "KEY 104")   ; h
+    (nelisp-ime-stateline-dispatch "KEY 97")    ; a
+    (let ((session (gethash nelisp-ime-stateline--session-id
+                            nelisp-ime-sessions)))
+      (should (eq (plist-get session :detail) 'candidates-only))
+      (let ((snapshot (nelisp-ime-session-status
+                       nelisp-ime-stateline--session-id)))
+        (should (equal (plist-get snapshot :segments) []))))))
+
 (provide 'nelisp-ime-stateline-test)
 ;;; nelisp-ime-stateline-test.el ends here

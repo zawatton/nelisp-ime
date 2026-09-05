@@ -45,6 +45,7 @@
   (cond ((or (null value) (eq value :null)) nil)
         ((equal value "full") 'full)
         ((equal value "compact") 'compact)
+        ((equal value "candidates-only") 'candidates-only)
         (t (error "nelisp-ime: unsupported snapshot detail %S" value))))
 
 (defun nelisp-ime-protocol--event (object)
