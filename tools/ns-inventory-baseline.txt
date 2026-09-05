@@ -246,6 +246,7 @@
 # a bignum one, so its shape moved; lisp/nelisp-stdlib-list.el, which has no
 # builtin to call, is untouched.  Same divergence, new shape.
 
+
 # 945 -> 960 and 724 -> 726 on 2026-09-04, nelisp-ime fork.  This tree
 # carries the IME framework on top of the runtime, and its public API is
 # counted the same way the 848 above is: 13 names across
@@ -276,7 +277,13 @@
 # this fork's own additions are the ns-prefix-violation and ns-private-escape
 # counts further down, which upstream did not touch.  Upstream's count is
 # taken and both comment blocks are kept.
-ns-collision 255
+#
+# Merge of NeLisp main into the nelisp-ime fork, 2026-09-06.  Both
+# sides appended here.  Unlike the earlier merges this time both
+# moved `ns-private-escape', so the counts below are not either
+# side's: they were measured on the merged tree with
+# `make ns-inventory' and written from that.
+ns-collision 256
 # 97 -> 96 on 2026-08-19: `string-equal' no longer differs between the two
 # files -- the prelude's now signals for a non-string instead of falling
 # through to `equal', and the lisp copy was brought with it.  Ratcheted down
@@ -753,7 +760,26 @@ ns-prefix-violation 960
 # reconcile to the measured tree so the collision identity gate can run.
 # 725 -> 724 on 2026-09-03: ratcheted down to the measured value (the gate
 # reported it one below baseline).
-ns-private-escape 726
+# 724 -> 725 on 2026-09-06 (predicates-accept-nil): `fboundp' on the
+# standalone reader wrongly rejected `nil'/`t' as non-symbols; the elisp
+# fix in scripts/nelisp-stdlib-prelude.el must filter out the sentinel
+# `symbol-function' leaks for a defconst-only symbol, the same value
+# `lisp/nelisp-stdlib-fast-hash.el' defines as `nelisp--unbound-marker'.
+# One more cross-file reference to that name, same conceded shape as
+# every other entry already in this ledger for it (lisp/nelisp-env.el,
+# lisp/nelisp-lexframe.el, lisp/nelisp-artifact.el, the two mirror-*
+# modules, several test files) -- not a boundary crossed by accident.
+
+#
+# Merge of NeLisp main into the nelisp-ime fork, 2026-09-06.  Both
+# sides appended here.  Unlike the earlier merges this time both
+# moved `ns-private-escape', so the counts below are not either
+# side's: they were measured on the merged tree with
+# `make ns-inventory' and written from that.  724 -> 726 here (the IME's two
+# private escapes) and 724 -> 725 upstream, and the merged tree measures 727,
+# which is both -- the two additions are independent, as the arithmetic
+# suggested and the measurement confirmed.
+ns-private-escape 727
 ns-unreadable 0
 
 # `pinned-collision KEY' pins every ns-collision and ns-collision-divergent
@@ -944,7 +970,7 @@ pinned-collision ns-collision-divergent	abs	lisp/nelisp-stdlib.el scripts/nelisp
 pinned-collision ns-collision-divergent	accept-process-output	packages/nelisp-process-adapter/src/nelisp-process-adapter.el scripts/nelisp-stdlib-prelude.el	d1b3b715b5b0
 pinned-collision ns-collision-divergent	add-to-list	lisp/nelisp-build-host.el scripts/nelisp-stdlib-prelude.el	2e959e15e953
 pinned-collision ns-collision-divergent	alist-get	lisp/nelisp-stdlib-misc.el scripts/nelisp-stdlib-prelude.el	7f1faf26747a
-pinned-collision ns-collision-divergent	append	lisp/nelisp-stdlib-list.el scripts/nelisp-stdlib-prelude.el	76c79da8f4e9
+pinned-collision ns-collision-divergent	append	lisp/nelisp-stdlib-list.el scripts/nelisp-stdlib-prelude.el	2277910d2ecd
 pinned-collision ns-collision-divergent	arrayp	lisp/nelisp-stdlib.el scripts/nelisp-stdlib-prelude.el	79c6a8dba449
 pinned-collision ns-collision-divergent	assoc	lisp/nelisp-stdlib-search.el scripts/nelisp-stdlib-prelude.el	1c6f31b6324b
 pinned-collision ns-collision-divergent	butlast	lisp/nelisp-stdlib-list.el scripts/nelisp-stdlib-prelude.el	7d0524ad6c34
@@ -976,7 +1002,7 @@ pinned-collision ns-collision-divergent	file-readable-p	lisp/nelisp-stdlib-misc.
 pinned-collision ns-collision-divergent	file-regular-p	lisp/nelisp-stdlib-misc.el scripts/nelisp-stdlib-prelude.el	2b2029793466
 pinned-collision ns-collision-divergent	file-truename	lisp/nelisp-stdlib-misc.el scripts/nelisp-stdlib-prelude.el	5b04ba8cfc4d
 pinned-collision ns-collision-divergent	floor	lisp/nelisp-stdlib.el scripts/nelisp-stdlib-prelude.el	4971512ef302
-pinned-collision ns-collision-divergent	format	lisp/nelisp-stdlib-plist-str.el scripts/nelisp-stdlib-prelude.el	eb65553a63d8
+pinned-collision ns-collision-divergent	format	lisp/nelisp-stdlib-plist-str.el scripts/nelisp-stdlib-prelude.el	b414a0b05778
 pinned-collision ns-collision-divergent	functionp	lisp/nelisp-stdlib.el scripts/nelisp-stdlib-prelude.el	3172cb365701
 pinned-collision ns-collision-divergent	gensym	lisp/nelisp-stdlib-misc.el scripts/nelisp-stdlib-prelude.el	22edbc59d344
 pinned-collision ns-collision-divergent	getenv	lisp/nelisp-build-host.el scripts/nelisp-stdlib-prelude.el	02471b7ae06d
@@ -1026,7 +1052,7 @@ pinned-collision ns-collision-divergent	plist-get	lisp/nelisp-stdlib-plist-str.e
 pinned-collision ns-collision-divergent	plist-member	lisp/nelisp-stdlib-plist-str.el scripts/nelisp-stdlib-prelude.el	e2a0d4406798
 pinned-collision ns-collision-divergent	plist-put	lisp/nelisp-stdlib-plist-str.el scripts/nelisp-stdlib-prelude.el	ec24000d8b85
 pinned-collision ns-collision-divergent	prin1	lisp/nelisp-stdlib-prn.el scripts/nelisp-stdlib-prelude.el	a915300b8c4f
-pinned-collision ns-collision-divergent	prin1-to-string	lisp/nelisp-stdlib-prn.el scripts/nelisp-stdlib-prelude.el	c9bf2dc60b9e
+pinned-collision ns-collision-divergent	prin1-to-string	lisp/nelisp-stdlib-prn.el scripts/nelisp-stdlib-prelude.el	67ab9e11bc4e
 pinned-collision ns-collision-divergent	princ	lisp/nelisp-stdlib-misc.el scripts/nelisp-stdlib-prelude.el	3975e89c8c57
 pinned-collision ns-collision-divergent	print	lisp/nelisp-stdlib-misc.el scripts/nelisp-stdlib-prelude.el	8d17563aed08
 pinned-collision ns-collision-divergent	read	lisp/nelisp-stdlib-reader.el scripts/nelisp-stdlib-prelude.el	35f6c738cdc9
@@ -1172,3 +1198,4 @@ pinned-collision ns-collision	nelisp--split-on-char	lisp/nelisp-stdlib-regexp.el
 pinned-collision ns-collision	nelisp-cl-generic--eql-matches	lisp/nelisp-cl-macros.el scripts/nelisp-stdlib-prelude.el
 pinned-collision ns-collision	nelisp-cl-generic--invoke-combined	lisp/nelisp-cl-macros.el scripts/nelisp-stdlib-prelude.el
 pinned-collision ns-collision	nelisp-cl-generic--head-matches	lisp/nelisp-cl-macros.el scripts/nelisp-stdlib-prelude.el
+pinned-collision ns-collision	nelisp-cl-generic--parse-defgeneric-methods	lisp/nelisp-cl-macros.el scripts/nelisp-stdlib-prelude.el

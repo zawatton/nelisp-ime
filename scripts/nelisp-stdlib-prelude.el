@@ -134,12 +134,14 @@
 ;; `intern' takes an OBARRAY it cannot honour -- one global table here --
 ;; but Emacs type-checks the argument, and accepting anything hid the fact
 ;; that it is ignored (recorded in tools/partial-accepted.txt).
+;; The check is in the native arm (`bf_obarray_arg_bad' in
+;; scripts/nelisp-standalone-build.el) since 2026-09-06: the elisp wrapper
+;; that used to do it here was one more interpreted call on every `intern'
+;; -- 22 us of a 26 us hit, on a 4 us native probe -- and every
+;; macro-generated name pays it.  The alias stays because the presence
+;; corpus and consumers name it.
 (unless (fboundp 'nelisp--native-intern)
-  (defalias 'nelisp--native-intern (symbol-function 'intern))
-  (defun intern (name &optional obarray)
-    (when (and obarray (not (obarrayp obarray)))
-      (signal 'wrong-type-argument (list 'obarrayp obarray)))
-    (nelisp--native-intern name)))
+  (defalias 'nelisp--native-intern (symbol-function 'intern)))
 ;; Absent, so a caller got `void-function' -- which reads as "the runtime
 ;; cannot do this" rather than "nobody wrote it yet".  There are no buffers
 ;; or byte-compiler here, so these answer nil and signal on a wrong type,
@@ -278,6 +280,49 @@ a negative, and signalling there turned a limit into a failure."
            (pe (nelisp--two-prod q (float n)))
            (rem (+ (- (- (car x) (car pe)) (cdr pe)) (cdr x))))
       (nelisp--two-sum q (/ rem (float n)))))
+  (defun nelisp--pow2-exact (n)
+    "2.0^N as an exact double, via repeated squaring (O(log N), never a
+per-unit loop).  Every intermediate the caller ever asks for stays inside
+the normal double exponent range (roughly [-1021, 1023]), so each squaring
+step is a pure exponent-field move -- exact, no rounding -- and the result
+is exact too."
+    (if (>= n 0)
+        (let ((r 1.0) (b 2.0) (e n))
+          (while (> e 0)
+            (when (= (logand e 1) 1) (setq r (* r b)))
+            (setq b (* b b))
+            (setq e (ash e -1)))
+          r)
+      (let ((r 1.0) (b 0.5) (e (- n)))
+        (while (> e 0)
+          (when (= (logand e 1) 1) (setq r (* r b)))
+          (setq b (* b b))
+          (setq e (ash e -1)))
+        r)))
+  (defun nelisp--scale-pow2 (acc k)
+    "ACC * 2^K, correctly rounded, in O(1) multiplications.
+K is bounded to roughly [-1075, 1024] by `exp's caller, which has already
+turned anything further out into a direct 0.0/+inf answer -- so this never
+loops a number of times proportional to the original |X| (the defect this
+replaces: the old code multiplied/divided by 2.0 once per unit of K, which
+made `(exp -1.0e6)' a ~1.44e6-iteration loop and `(exp -1.0e9)' a ~1.44e9-
+iteration one).
+
+2^1024 and 2^-1075 are not representable as standalone doubles (they
+overflow / underflow before ACC is ever applied), even though ACC*2^K can
+be a perfectly ordinary finite or subnormal result -- the classic
+premature-overflow/underflow trap.  Both ends are split into two exact
+multiplications so only the LAST one ever rounds: for K>1023 (only 1024 is
+reachable here), scale by 2 and by 2^1023 separately; for K<-1021, scale by
+2^-1021 (still a normal double -- ACC is in [2^-1,2^1), so this step alone
+cannot itself underflow) and then by the small remaining 2^(K+1021), whose
+single rounding step is exactly the hardware division/multiplication a
+correctly-rounded libm performs, denormals included."
+    (cond
+     ((= k 0) acc)
+     ((> k 1023) (* (* acc 2.0) (nelisp--pow2-exact (1- k))))
+     ((< k -1021) (* (* acc (nelisp--pow2-exact -1021)) (nelisp--pow2-exact (+ k 1021))))
+     (t (* acc (nelisp--pow2-exact k)))))
   (defun exp (x)
     "e raised to X.
 Newton-free and correctly rounded: x is reduced to k*ln2 + r with ln2 split
@@ -285,11 +330,29 @@ hi/lo so the subtraction is exact, and exp(r) is then summed term by term in
 DOUBLE-DOUBLE arithmetic.  A plain double series left the last bit wrong --
 (exp 1) came back one ULP above the host's answer -- because the residual
 that decides the rounding is smaller than the sum can represent.  Measured
-against the host over 28 arguments: none differ."
+against the host over 28 arguments: none differ.
+
+Before any of that: NaN passes through unchanged, and X outside
+[-745.13321910194111, 709.78271289338397] (fdlibm's own u_threshold /
+o_threshold -- the exact points past which every finite double answer is
+0.0 or +inf) short-circuits to 0.0 / +inf directly.  Without this, `k'
+(the number of ln2's reduced out of X) grows proportionally to |X| with no
+bound: `truncate' itself is a hardware f64->i64 cast that returns the
+Intel-SDM-mandated indefinite sentinel for any magnitude past i64 range
+-- garbage in, `hi - k*ln2' collapses to inf-inf (NaN) -- and even where
+`truncate' still answers correctly, the OLD final-scaling loop ran |k|
+times, so `(exp -1.0e6)' took ~1.44e6 iterations and `(exp -1.0e9)' ~1.44e9
+-- the reported hang.  Clamping first keeps k bounded to about [-1075,
+1024] no matter how extreme X is, which both `nelisp--scale-pow2' and
+`truncate' (now only ever asked about a bounded product) handle correctly."
     (nelisp--check-number x)
     (let ((xf (float x)))
-      (if (= xf 0.0)
-          1.0
+      (cond
+       ((/= xf xf) xf)                                     ; NaN in -> NaN out
+       ((= xf 0.0) 1.0)
+       ((> xf 7.09782712893383973096e+02) (/ 1.0 0.0))      ; +inf: past o_threshold
+       ((< xf -7.45133219101941108420e+02) 0.0)             ; 0.0: past u_threshold
+       (t
         (let* ((k (if (> xf 0)
                       (truncate (+ (* 1.44269504088896338700e+00 xf) 0.5))
                     (truncate (- (* 1.44269504088896338700e+00 xf) 0.5))))
@@ -304,11 +367,7 @@ against the host over 28 arguments: none differ."
             (setq term (nelisp--dd-div-int term n))
             (setq sum (nelisp--dd-add sum term))
             (setq n (1+ n)))
-          (let ((acc (+ (car sum) (cdr sum))) (j (abs k)))
-            (while (> j 0)
-              (setq acc (if (< k 0) (/ acc 2.0) (* acc 2.0)))
-              (setq j (1- j)))
-            acc))))))
+          (nelisp--scale-pow2 (+ (car sum) (cdr sum)) k)))))))
 ;; There are no buffers here, so this can only report the type error --
 ;; which is the half Emacs reaches first anyway for a bad position.
 (unless (fboundp 'buffer-substring-no-properties)
@@ -1803,21 +1862,22 @@ nothing."
 ;; native `nelisp--intern-lookup' (Doc 163 Phase C), which reports a miss
 ;; instead of interning.  Falling back to `intern' -- which never answers
 ;; nil -- is what made a `(while (setq x (intern-soft ...)))' probe loop
-;; run forever.  This shadows nothing: `intern-soft' was in
-;; lisp/nelisp-stdlib-misc.el and never reached the prelude, so the
-;; standalone had no `intern-soft' at all.
-(defun intern-soft (name &optional obarray)
-  "Return the symbol named NAME if it is interned, else nil.
+;; run forever.  Since 2026-09-06 the standalone has a native `intern-soft'
+;; arm with exactly this contract (scripts/nelisp-standalone-build.el), so
+;; this definition is reached only by a binary older than the arm.
+(unless (fboundp 'intern-soft)
+  (defun intern-soft (name &optional obarray)
+    "Return the symbol named NAME if it is interned, else nil.
 NeLisp has one global intern table and no first-class obarray object, so a
 non-nil OBARRAY is not honoured.  The probe is `nelisp--intern-lookup\', which
 reports a miss instead of interning -- falling back to `intern\', which never
 answers nil, is what made a `(while (setq x (intern-soft ...)))\' probe loop
 run forever."
-  (when (and obarray (not (obarrayp obarray)))
-    (signal 'wrong-type-argument (list 'obarrayp obarray)))
-  (cond ((symbolp name) name)
-        ((stringp name) (nelisp--intern-lookup name))
-        (t (signal 'wrong-type-argument (list 'stringp name)))))
+    (when (and obarray (not (obarrayp obarray)))
+      (signal 'wrong-type-argument (list 'obarrayp obarray)))
+    (cond ((symbolp name) name)
+          ((stringp name) (nelisp--intern-lookup name))
+          (t (signal 'wrong-type-argument (list 'stringp name))))))
 (unless (fboundp 'vconcat)
   (defun vconcat (&rest seqs)
     (dolist (x seqs) (nelisp--check-seq-list x))
@@ -2186,7 +2246,51 @@ loop for the exponent (= no `expt' / `float' primitive needed)."
                  (setq r next))
                (setq i (1+ i)))
              r))
-          ((and (integerp e) (>= e 0)) (let ((r 1) (i 0)) (while (< i e) (setq r (* r b) i (1+ i))) r))
+          ;; A non-negative integer E against a non-integer (typically
+          ;; float) B used to be a flat `(while (< i e) (setq r (* r b)) ...)'
+          ;; loop -- fine for a small E, but E arrives here as a huge integer
+          ;; two different ways a large float exponent actually takes: E
+          ;; itself may already be a huge integer-valued float truncated to
+          ;; an integer just above, or the HALF-INTEGER branch below computes
+          ;; `(expt b n)' with N in the millions.  `(expt 2.0 1442695.5)'
+          ;; (reached via the half-integer branch, N = 1442695) took over
+          ;; five seconds here before this fix -- the same shape of defect
+          ;; `exp' had (a loop count proportional to the raw exponent, not
+          ;; bounded by anything the float format itself bounds), just one
+          ;; level up the call chain.  Any |B| != 1 overflows to +-infinity
+          ;; or underflows to 0.0 within about 2100 squarings-worth of
+          ;; iterations no matter how huge E is (that is the entire double
+          ;; exponent range), and both 0.0 and +-infinity are absorbing under
+          ;; further multiplication by a nonzero finite B -- so once R gets
+          ;; there, continuing the loop cannot change the answer and only
+          ;; burns iterations.  B's sign is factored out up front (E's
+          ;; parity fixes it once, for the FULL exponent -- picking it up
+          ;; from whatever transient sign R had at the moment of early exit
+          ;; would be wrong) and the loop runs on `mag' = |B| instead: since
+          ;; IEEE-754 multiplication rounds the same way regardless of
+          ;; operand sign (only the result's sign bit differs, XORed
+          ;; separately), this is bit-for-bit the same computation as the
+          ;; original sign-alternating one for every iteration that used to
+          ;; run, just able to stop once it reaches an absorbing state.
+          ;; |B| == 1.0 is its own absorbing state from iteration zero
+          ;; (1.0^n == 1.0) and is special-cased so it costs O(1) rather than
+          ;; O(E) -- otherwise `(expt -1.0 1442695)' would still crawl.
+          ;; A |B| meaningfully close to but not exactly 1 (e.g. 1+1e-9) can
+          ;; still take a very long time to reach the absorbing state this
+          ;; way; that residual case is a pre-existing property of this
+          ;; linear algorithm (unrelated to the range-vs-|X| defect this
+          ;; fixes) and is not addressed here.
+          ((and (integerp e) (>= e 0))
+           (let* ((neg (and (< b 0) (= 1 (logand e 1))))
+                  (mag (if (< b 0) (- b) b)))
+             (cond
+              ((= e 0) 1)
+              ((= mag 1.0) (if neg -1.0 1.0))
+              (t (let ((r 1) (i 0))
+                   (while (and (< i e) (/= r 0.0) (<= r 1.7976931348623157e+308))
+                     (setq r (* r mag))
+                     (setq i (1+ i)))
+                   (if neg (- r) r))))))
           ((integerp e) (/ 1.0 (expt b (- e))))
           ;; The half power is the non-integer exponent that actually turns
           ;; up, and `sqrt' answers it.  A general float exponent still
@@ -3061,20 +3165,52 @@ path, which asks for a NUMBER first and only then for an integer."
 
 (defun append (&rest args)
   "Concatenate sequences ARGS into a fresh proper-list spine.\nNon-final args may be list / vector / string / nil.  The FINAL arg\nis used as the tail (= unchanged, can be any value).  Single-arg\ncall returns the arg unchanged (= no copy)."
-  (nelisp--doc200-check-string-mix args)
-  (cond ((null args) nil) ((null (cdr args)) (car args))
-	(t
-	 (let ((cur args) (acc nil) (tail nil))
-	   (while (cdr cur)
-	     (nelisp--check-seq-list (car cur))
-	     (setq acc (nelisp--append-collect acc (car cur)))
-	     (setq cur (cdr cur)))
-	   (setq tail (car cur))
-	   (let ((result tail))
-	     (while acc
-	       (setq result (cons (car acc) result))
-	       (setq acc (cdr acc)))
-	     result)))))
+  (cond
+   ((null args) nil)
+   ((null (cdr args)) (car args))
+   (t
+    ;; Fast path: every non-final arg is nil or a cons -- the shape
+    ;; almost every hot caller uses (cl-lib, seq, pcase, regexp-opt,
+    ;; keymaps).  One pass per arg, consing straight onto the shared
+    ;; tail: no separate properness pre-scan, no per-arg helper-
+    ;; function call, and no string-mix scan.  Skipping the mix scan
+    ;; is safe here because it only ever fires between TWO strings
+    ;; (`nelisp--doc200-check-string-mix' needs one raw-byte-unibyte
+    ;; string and one multibyte string among the arguments), and this
+    ;; branch requires every non-final arg to be list-shaped, so at
+    ;; most the final (tail) argument can be a string -- one string
+    ;; can never trigger a two-string mix.
+    (let ((probe args) (fast t))
+      (while (and fast (cdr probe))
+        (unless (let ((a (car probe))) (or (null a) (consp a)))
+          (setq fast nil))
+        (setq probe (cdr probe)))
+      (if fast
+          (let ((cur args) (acc nil))
+            (while (cdr cur)
+              (let ((seq (car cur)))
+                (while (consp seq)
+                  (setq acc (cons (car seq) acc))
+                  (setq seq (cdr seq)))
+                (when seq (signal 'wrong-type-argument (list 'listp seq))))
+              (setq cur (cdr cur)))
+            (let ((result (car cur)))
+              (while acc
+                (setq result (cons (car acc) result))
+                (setq acc (cdr acc)))
+              result))
+        (nelisp--doc200-check-string-mix args)
+        (let ((cur args) (acc nil) (tail nil))
+          (while (cdr cur)
+            (nelisp--check-seq-list (car cur))
+            (setq acc (nelisp--append-collect acc (car cur)))
+            (setq cur (cdr cur)))
+          (setq tail (car cur))
+          (let ((result tail))
+            (while acc
+              (setq result (cons (car acc) result))
+              (setq acc (cdr acc)))
+            result)))))))
 
 (defun caar (x) (car (car x)))
 
@@ -4641,7 +4777,18 @@ bodies (= Stage 4 follow-up).  Indent / edebug specs come back when
 ;; specializers are now supported too (real Emacs generalizer priority
 ;; 80 -- between `eql' (100) and any type match (10); matches when the
 ;; argument is a cons whose `car' is `eql' to VALUE), needed by `eat.el'
-;; transitively via EIEIO/cl-generic subclass dispatch.
+;; transitively via EIEIO/cl-generic subclass dispatch.  T81 addendum:
+;; `cl-defgeneric' now supports real Emacs's full `(NAME ARGS
+;; [DOCSTRING] [OPTIONS-AND-METHODS...] &rest DEFAULT-BODY)' grammar --
+;; a non-empty DEFAULT-BODY becomes an ordinary unspecialized primary
+;; method (no new dispatch machinery: it is just another method-table
+;; entry), `(:method ...)' forms expand to ordinary `cl-defmethod'
+;; calls, `(declare ...)'/`(:documentation ...)'/
+;; `(:argument-precedence-order ...)' are accepted (the first two
+;; syntactically only, with no side effect; the third is a no-op since
+;; §3.1 supports only a single dispatch argument) -- needed by
+;; `eieio.el' itself, whose very first `cl-defgeneric' call
+;; (`eieio-object-name-string') uses exactly the default-body shape.
 ;;
 ;; No `declare' in the macro bodies below -- see the `cl-defstruct'
 ;; comment above: the standalone reader does not yet strip `declare'
@@ -5110,21 +5257,106 @@ and callable from both `cl-defgeneric' and `cl-defmethod' -- real
     (put name 'nelisp-cl-generic--dispatcher-installed t)
     (defalias name (nelisp-cl-generic--make-dispatcher name))))
 
+(defun nelisp-cl-generic--parse-defgeneric-methods (name arglist body)
+  "Parse the OPTIONS-AND-METHODS/DEFAULT-BODY grammar of a `cl-defgeneric'
+call for NAME (Doc 185 §3.1, T81 addendum -- default-method bodies and
+inline `:method' forms).  BODY is `cl-defgeneric''s own trailing macro
+argument, with any leading docstring not yet stripped.  Real Emacs's own
+`cl-defgeneric' (`lisp/emacs-lisp/cl-generic.el') walks
+OPTIONS-AND-METHODS left to right consuming any run of forms whose CAR
+is a keyword or the symbol `declare'; the first form whose CAR is
+neither ends that run, and everything from there on (however many forms
+follow) is \"assumed to be a default method body\" -- this reproduces
+that exact walk, form for form, rather than a stricter re-derivation of
+it.  Returns a list of method forms, each ready to splice as
+`(cl-defmethod ,name ,@method)', in the exact order they should be
+*defined* (source order): every `(:method QUALIFIERS ARGS BODY...)'
+form's `(QUALIFIERS ARGS BODY...)' cdr verbatim -- QUALIFIERS/ARGS/BODY
+go through `cl-defmethod''s own parsing and loud-failure matrix
+unchanged, so e.g. a bare `:around' with no `:extra' is still rejected
+there exactly as it would be at a top-level `cl-defmethod' call -- then,
+if anything remains once that run ends, one final method
+`(ARGLIST . REMAINING-BODY)': NAME's own ARGLIST, verbatim, with no
+specializers at all, i.e. an ordinary unspecialized primary method (T81's
+whole point: the default body needs no new dispatch machinery, it is
+just another entry in the same method table `cl-defmethod' already
+maintains, so it participates in dispatch, chains via
+`cl-call-next-method', and gets replaced in place -- never duplicated --
+by a later `cl-defgeneric' redefinition, exactly like any other
+unspecialized primary method).  Nothing remaining (e.g. a `cl-defgeneric'
+whose only content is a docstring and/or `declare') defines no default
+method, exactly as an empty `cl-defgeneric' already did before this
+addendum.
+
+`(declare ...)' is accepted and its content is NOT applied: this subset
+does not implement e.g. `(indent N)' or `(obsolete ...)' side effects --
+editor/byte-compiler metadata, with no cl-generic dispatch semantics
+either way (confirmed against host Emacs 31.1: `(declare (obsolete nil
+\"26.1\"))' with no other body defines zero methods there too).  A
+leading docstring and/or one `(:documentation STRING)' form are likewise
+accepted and discarded, never installed as the generic's own
+documentation (unchanged from before this addendum).  Giving a doc
+string twice, or `declare' twice, is a loud `error' -- real Emacs
+signals `Multiple doc strings for %S'/`Multiple \\=`declare\\=' for %S'
+for the same two cases, measured this session.
+`(:argument-precedence-order ...)' is accepted and ignored: Doc 185
+§3.1 supports a single dispatch argument (position 0) only, so there is
+never more than one specializer to reorder.  Any OTHER keyword-headed
+form is a loud macroexpansion-time `error' naming it -- Doc 185 §3.5's
+loud-failure discipline extended to this grammar, never a silently-
+dropped option."
+  (let ((methods nil) (have-doc nil) (have-declare nil) (looping t))
+    (when (and body (stringp (car body)))
+      (setq have-doc t)
+      (setq body (cdr body)))
+    (while (and looping body)
+      (let* ((form (car body))
+             (head (car-safe form)))
+        (cond
+         ((not (or (keywordp head) (eq head 'declare)))
+          (setq looping nil))
+         ((eq head :documentation)
+          (when have-doc
+            (error "cl-defgeneric %s: multiple doc strings (a leading \
+docstring together with (:documentation ...), or (:documentation ...) \
+given twice)" name))
+          (setq have-doc t)
+          (setq body (cdr body)))
+         ((eq head 'declare)
+          (when have-declare
+            (error "cl-defgeneric %s: multiple `declare' forms" name))
+          (setq have-declare t)
+          (setq body (cdr body)))
+         ((eq head :method)
+          (push (cdr form) methods)
+          (setq body (cdr body)))
+         ((eq head :argument-precedence-order)
+          (setq body (cdr body)))
+         (t
+          (error "cl-defgeneric %s: unsupported option %S (Doc 185 \
+subset: (:documentation STRING), (declare ...), (:method ...), \
+(:argument-precedence-order ...) only)"
+                 name form)))))
+    (when body
+      (push (cons arglist body) methods))
+    (nreverse methods)))
+
 (defmacro cl-defgeneric (name arglist &rest body)
-  "Declare NAME as a generic function over ARGLIST (Doc 185 §3.1).
-Installs NAME as a dispatching function with no methods yet -- add
-methods with `cl-defmethod'.  BODY may be a single leading docstring
-only: this subset does not implement CLOS-style default-method bodies,
-so a non-docstring BODY form is a loud macroexpansion-time `error'
-rather than a silently-ignored default method."
-  (ignore arglist)
-  (when (and body (stringp (car body))) (setq body (cdr body)))
-  (when body
-    (error "cl-defgeneric %s: default-method body not supported by this \
-subset -- declare with no body, add methods via cl-defmethod (Doc 185 \
-§3.1)"
-           name))
-  `(prog1 ',name (nelisp-cl-generic--ensure ',name)))
+  "Declare NAME as a generic function over ARGLIST (Doc 185 §3.1,
+extended by the T81 addendum: default-method bodies and OPTIONS-AND-
+METHODS are now supported, not just a bare declaration).  Installs NAME
+as a dispatching function, then defines, in source order, every method
+`nelisp-cl-generic--parse-defgeneric-methods' finds in BODY -- see that
+function's docstring for the full per-option grammar (`(declare ...)',
+`(:documentation ...)', `(:method ...)', `(:argument-precedence-order
+...)', and the trailing default-method-body rule) and its two `error'
+cases (a doc string or `declare' given twice).  A non-docstring,
+non-option BODY form used to be an unconditional loud `error' before
+this addendum; it is now the start of the default method body instead."
+  `(prog1 ',name
+     (nelisp-cl-generic--ensure ',name)
+     ,@(mapcar (lambda (m) `(cl-defmethod ,name ,@m))
+               (nelisp-cl-generic--parse-defgeneric-methods name arglist body))))
 
 (defmacro cl-defmethod (name &rest args)
   "Define a method on generic NAME (Doc 185's subset of real
@@ -8102,10 +8334,18 @@ as a likely mistake.")
 ;; function body in `build-tool/src/eval/builtins.rs' are removed in
 ;; the same commit (= Stage 7.1.4 in Doc 64).
 ;;
-;; Float formatting matches the prior Rust `Sexp' Display closely
-;; enough for substrate use: `(number-to-string X)' (= `%g')
-;; followed by a `.0' suffix when the result lacks `.', `e' or `E'.
-;; Edge cases (very large / NaN / inf) are passed through unchanged.
+;; Float formatting is `(number-to-string X)', unchanged (Doc 159 SS15).
+;; `number-to-string' on a float is itself the native shortest-round-trip
+;; printer (Doc 159 SS10 forward): as of that section it already emits
+;; Emacs's exact `prin1'/`princ' spelling, INCLUDING the trailing `.0',
+;; the `e+NN'/`e-NN' exponent form, and the `1.0e+INF' / `-1.0e+INF' /
+;; `0.0e+NaN' special forms.  This file used to run the result through a
+;; second, prelude-level pass (`string-search' for `.'/`e', a manual
+;; trailing-zero trim) to patch up a %g-with-one-digit STUB `number-to-
+;; string' — that stub is long gone, so the second pass had become pure
+;; overhead: `string-search' is prelude Elisp, not a native primitive,
+;; and Doc 159 SS15 measured it at roughly 200x the cost of the single
+;; native `number-to-string' call it was wrapping.
 ;;
 ;; Reader-macro abbreviation: a 2-element cons `(QUOTE-TAG ARG)' whose
 ;; head is one of `quote' / `function' or the punctuation-named symbols
@@ -8211,22 +8451,11 @@ needs escaping because the reader consumes it as an escape prefix."
       (nelisp--prn-chunks-string chunks))))
 
 (defun nelisp--prn-float (x)
-  (let ((s (number-to-string x)))
-    (cond
-     ((string= s "inf") s)
-     ((string= s "-inf") s)
-     ((string= s "NaN") s)
-     (t
-      (let ((dot (string-search "." s))
-            (eee (or (string-search "e" s) (string-search "E" s))))
-        (cond
-         (eee s)
-         ((null dot) (concat s ".0"))
-         (t
-          (let ((i (1- (length s))))
-            (while (and (> i (1+ dot)) (eq (aref s i) ?0))
-              (setq i (1- i)))
-            (substring s 0 (1+ i))))))))))
+  "Return the printed representation of float X.
+`number-to-string' IS this function -- see the Commentary above (Doc 159
+SS15) for why the extra `string-search'-based pass this used to run is
+gone rather than merely made faster."
+  (number-to-string x))
 
 (defun nelisp--prn-reader-macro-abbrev (lst escape)
   (when (and (consp lst) (symbolp (car lst))
@@ -8431,7 +8660,15 @@ claimed to match, only the shape."
           (setq l (cdr l)))))))
 (unless (fboundp 'prin1-to-string)
   (defun prin1-to-string (object &optional noescape overrides)
-    (nelisp--check-print-overrides overrides)
+    ;; OVERRIDES is nil in the overwhelming majority of calls (every
+    ;; unadorned `prin1-to-string'/`prin1'/`princ'/`print' call site) --
+    ;; `nelisp--check-print-overrides' returns nil immediately for that
+    ;; case anyway (its own first `cond' clause), so calling it is a
+    ;; whole extra interpreted function-call layer bought for nothing on
+    ;; the common path.  Doc 159 SS15: skipping it measurably tightens
+    ;; the float-heavy case this file exists to make fast, and changes
+    ;; nothing observable (a non-nil OVERRIDES is still validated).
+    (when overrides (nelisp--check-print-overrides overrides))
     (nelisp--prn-to-string object (not noescape))))
 
 ;; --- Doc 143: minimal read-from-string for the reader runtime -------------
@@ -9209,11 +9446,10 @@ Prefers the real process id; falls back to the clock, marked with a leading
 ;; `directory-files' (which calls it) hang indefinitely.
 ;;
 ;; `nelisp--syscall-readdir-names' IS a proper dispatch-armed builtin that
-;; already returns a newline-joined string of all entry names (including
-;; "." and "..").  We split that string, prepend the canonical absolute
-;; directory path as the first element, and return `(ABS-DIR NAME ...)',
-;; exactly matching the contract expected by `directory-files' in
-;; nelisp-stdlib-misc.el.
+;; returns a newline-joined string of all entry names (including "." and
+;; "..") for existing one-argument callers.  Directory operations here ask
+;; its optional mode for NUL separators, because NUL cannot occur in a
+;; filename, and pass the matching optional mode to the native decoder.
 ;;
 ;; Guarded by `(fboundp 'nelisp--syscall-readdir-names)': true only on the
 ;; standalone reader binary, so host Emacs is unaffected.  Uses `fset'
@@ -9226,73 +9462,78 @@ Prefers the real process id; falls back to the clock, marked with a leading
 ;; takes effect.  The misc.el version would also work once readdir is fixed,
 ;; but the fset here is a belt-and-suspenders override that avoids any
 ;; dependency on the misc.el load order.
-;; nelisp--readdir-scan-raw: helper that walks a newline-terminated name
-;; string from nelisp--syscall-readdir-names and builds a list of strings,
-;; one per entry.  The loop uses `if' (not the `or' macro) to avoid the
-;; let-frame overflow that `or' causes inside tight while loops on the
-;; standalone reader when the string exceeds ~32KB.
+;; nelisp--readdir-scan-raw: the standalone registers a native byte-offset
+;; decoder under this existing name.  The interpreted definition remains for
+;; hosted/older runtimes.  NUL-SEPARATED selects the collision-free raw form;
+;; omitted/nil preserves the legacy newline representation.
 ;;
 ;; Callers pass a SKIP-DOTDOT argument: when non-nil, "." and ".." are
 ;; excluded (needed by directory-files).
-(defun nelisp--readdir-scan-raw (raw skip-dotdot)
-  (let ((len (length raw))
-        (idx 0)
-        (start 0)
-        (result nil))
-    (while (< idx len)
-      (if (= (aref raw idx) 10)
-          (let ((name (substring raw start idx)))
-            (if skip-dotdot
-                (if (= (length name) 1)
-                    (if (= (aref name 0) 46)
-                        nil
-                      (setq result (cons name result)))
-                  (if (= (length name) 2)
+(unless (fboundp 'nelisp--readdir-scan-raw)
+  (defun nelisp--readdir-scan-raw (raw skip-dotdot &optional nul-separated)
+    (let ((len (length raw))
+          (idx 0)
+          (start 0)
+          (separator (if nul-separated 0 10))
+          (result nil))
+      (while (< idx len)
+        (if (= (aref raw idx) separator)
+            (let ((name (substring raw start idx)))
+              (if skip-dotdot
+                  (if (= (length name) 1)
                       (if (= (aref name 0) 46)
-                          (if (= (aref name 1) 46)
-                              nil
-                            (setq result (cons name result)))
+                          nil
                         (setq result (cons name result)))
-                    (setq result (cons name result))))
-              (setq result (cons name result)))
-            (setq start (1+ idx))))
-      (setq idx (1+ idx)))
-    (nreverse result)))
+                    (if (= (length name) 2)
+                        (if (= (aref name 0) 46)
+                            (if (= (aref name 1) 46)
+                                nil
+                              (setq result (cons name result)))
+                          (setq result (cons name result)))
+                      (setq result (cons name result))))
+                (setq result (cons name result)))
+              (setq start (1+ idx))))
+        (setq idx (1+ idx)))
+      (nreverse result))))
 (when (fboundp 'nelisp--syscall-readdir-names)
   ;; fset nelisp--syscall-readdir: pure-elisp replacement for the CLASS-2
   ;; deferred builtin.  Returns (ABS-DIR NAME ...) or nil, matching the Rust
   ;; bi_syscall_readdir contract expected by directory-files in misc.el.
   (fset 'nelisp--syscall-readdir
         (lambda (dir)
-          (let ((raw (nelisp--syscall-readdir-names dir)))
+          (let ((raw (nelisp--syscall-readdir-names dir t)))
             (if raw
                 (cons (expand-file-name dir)
-                      (nelisp--readdir-scan-raw raw nil))
+                      (nelisp--readdir-scan-raw raw nil t))
               nil))))
   ;; fset directory-files: override the misc.el version (which calls
   ;; nelisp--syscall-readdir, itself deferred) with one that calls
-  ;; nelisp--syscall-readdir-names directly and scans via the
-  ;; nelisp--readdir-scan-raw helper (no or-macro loops).
+  ;; nelisp--syscall-readdir-names directly.  The common no-FULL/no-MATCH
+  ;; case returns the native decoder's list as-is, avoiding a second
+  ;; interpreted traversal and reversal.
   (fset 'directory-files
         (lambda (directory &optional full match _nosort)
-          (let ((raw (nelisp--syscall-readdir-names directory)))
+          (let ((raw (nelisp--syscall-readdir-names directory t)))
             (if raw
-                (let ((names (nelisp--readdir-scan-raw raw t))
+                (let ((names (nelisp--readdir-scan-raw raw t t))
                       (out nil))
-                  (while names
-                    (let ((name (car names)))
-                      (if match
-                          (if (string-match-p match name)
+                  (if (if full t match)
+                      (progn
+                        (while names
+                          (let ((name (car names)))
+                            (if match
+                                (if (string-match-p match name)
+                                    (setq out (cons (if full
+                                                        (expand-file-name name directory)
+                                                      name)
+                                                    out)))
                               (setq out (cons (if full
                                                   (expand-file-name name directory)
                                                 name)
-                                              out)))
-                        (setq out (cons (if full
-                                            (expand-file-name name directory)
-                                          name)
-                                        out))))
-                    (setq names (cdr names)))
-                  (nreverse out))
+                                              out))))
+                          (setq names (cdr names)))
+                        (nreverse out))
+                    names))
               nil)))))
 (unless (fboundp 'file-exists-p)
   (defun file-exists-p (filename)
@@ -9374,8 +9615,8 @@ and only running both says which."
 (unless (fboundp 'delete-file)
   (defun delete-file (filename &optional _trash) (nelisp--syscall-path 87 filename) nil))
 (defun nelisp--delete-directory-recursive (path)
-  (let ((names (nelisp--split-on-char
-                (or (nelisp--syscall-readdir-names path) "") 10 t)))
+  (let ((names (nelisp--readdir-scan-raw
+                (or (nelisp--syscall-readdir-names path t) "") t t)))
     (dolist (name names)
       (unless (or (equal name ".") (equal name ".."))
         (nelisp--delete-directory-recursive
@@ -10318,13 +10559,31 @@ NUL.  Emacs signals for every one of those."
       (signal 'wrong-type-argument (list 'characterp arg)))))
   arg)
 
+;; Fast path (2026-09-06).  `nelisp--format-simple' is a native arm that
+;; answers the finished string when every directive is a plain %s %d %i %o
+;; %x %X %c %% with a matching, correctly-typed argument, and nil for
+;; anything the field-width / precision / type-check layer below has to
+;; look at.  That layer cost 200 us for (format "abc") and 1.4 ms for
+;; (format "sym-%d" i) against 14 us / 27 us native; T77's "intern is 1000x
+;; slower than Emacs" reproducer was this layer under `(intern (format ...))'.
+;; A binary older than the arm keeps the full layer for every call.
+(unless (fboundp 'nelisp--format-simple)
+  (defun nelisp--format-simple (_template _args) nil))
+
 (defun format (template &rest args)
   "Format TEMPLATE with ARGS honoring %[flags][width][.prec]conv (Doc 22 A7).
-Width, left-justify (-), zero-pad (0), sign (+/space) and string precision
-(.N) are applied in elisp; %f/%F honor their .PRECISION via
-`nelisp--ffmt-f' (Doc 159 §3); %S uses `prin1-to-string' and the remaining
-conversions are delegated to native `format', which lacks only the field-width
-layer."
+Plain directives with matching arguments take the native fast path
+`nelisp--format-simple'; everything else goes through `nelisp--format-full',
+where width, left-justify (-), zero-pad (0), sign (+/space) and string
+precision (.N) are applied in elisp, %f/%F honor their .PRECISION via
+`nelisp--fmt-float' (Doc 159 §3), %S uses `prin1-to-string' and the remaining
+conversions are delegated to native `format', which lacks only the
+field-width layer."
+  (or (nelisp--format-simple template args)
+      (nelisp--format-full template args)))
+
+(defun nelisp--format-full (template args)
+  "The full elisp `format' layer over TEMPLATE and the list ARGS; see `format'."
   (nelisp--check-string template)
   (let ((n (length template)) (i 0) (out "") (argp args))
     (while (< i n)
@@ -10382,6 +10641,15 @@ layer."
                                           (char-to-string conv)))))
                   (if (= conv 37)        ; ?%
                       (setq out (concat out "%"))
+                    ;; Emacs signals when the arguments run out; this
+                    ;; layer used to read (car nil) and print "nil" in
+                    ;; the slot -- (format "%s %s" "one") was "one nil".
+                    ;; Found 2026-09-06 by the fast path's parity test:
+                    ;; `nelisp--format-simple' declines the call for
+                    ;; exactly this reason and relies on the signal here.
+                    (unless argp
+                      (signal 'error
+                              (list "Not enough arguments for format string")))
                     (let* ((arg (nelisp--format-check-arg conv (car argp)))
                            (body (if (and (numberp arg)
                                           (or (= conv 102) (= conv 70)   ; f F
@@ -10535,6 +10803,82 @@ native predicates."
      ((floatp x) 'float)
      ((vectorp x) 'vector)
      (t 'cons))))
+
+;; native `fboundp' rejects `nil' and `t' with `(wrong-type-argument
+;; symbolp nil)' even though `symbolp' correctly accepts both -- nil and
+;; t are symbols, just ones whose function cell can never usefully hold
+;; anything in ordinary use.  cc-mode's cc-defs.el hits this at load time
+;; through `(and (symbolp form) (fboundp form))' with FORM bound to nil,
+;; so every package that requires cc-mode (json-mode, csharp-mode, ...)
+;; failed to load on the standalone reader.  Measured against Emacs 31.1:
+;; `(fboundp nil)' is nil (nil can never be `fset', so this is always
+;; false); `(fboundp t)' is nil in the ordinary case but t if `t' has
+;; actually been `fset' (unlike nil, t's function cell is not otherwise
+;; protected) -- so this defers to `symbol-function' for every symbol
+;; rather than hard-coding nil/t as always-unbound.  `symbol-function'
+;; itself sometimes answers the internal `nelisp--unbound-marker'
+;; sentinel for a symbol that only ever got a `defconst' (see the sibling
+;; gap this masks: a variable-only symbol's function-cell mirror entry
+;; holds the marker, not a clean nil), so that is filtered here too, the
+;; same as the native check already did for ordinary symbols.
+(unless (fboundp 'nelisp--native-fboundp)
+  (fset 'nelisp--native-fboundp (symbol-function 'fboundp)))
+(defun fboundp (symbol)
+  "Return t if SYMBOL's function definition is not nil."
+  (if (symbolp symbol)
+      (let ((def (symbol-function symbol)))
+        (and def (not (eq def 'nelisp--unbound-marker)) t))
+    (nelisp--native-fboundp symbol)))
+
+;; `macrop', `commandp' and `indirect-function' do not exist at all on the
+;; standalone reader (void-function) -- cc-mode and friends have been
+;; shimming them from the consuming side until now.  Ported directly from
+;; GNU Emacs's own algorithms (`eval.c''s indirect_function/Fcommandp,
+;; `subr.el''s `macrop'), specialised to the two function shapes this
+;; runtime actually produces: a builtin is `(builtin NAME)', an evaluated
+;; lambda is `(closure ENV ARGS . BODY)', and an unevaluated lambda literal
+;; (never passed through the evaluator, e.g. stored via `fset' of a quoted
+;; `(lambda ...)' form, which is how this prelude's own bootstrap
+;; `defmacro' builds a macro's function) is `(lambda ARGS . BODY)' with no
+;; ENV slot.  All measured against Emacs 31.1.
+(unless (fboundp 'indirect-function)
+  (defun indirect-function (object &optional _noerror)
+    "Return the function at the end of OBJECT's function chain.
+If OBJECT is not a symbol, just return it.  Otherwise, follow all
+function indirections -- through `nil' and `t', which are symbols like
+any other -- to find the final function binding and return it."
+    (while (and (symbolp object) object)
+      (setq object (symbol-function object)))
+    object))
+
+(unless (fboundp 'macrop)
+  (defun macrop (object)
+    "Non-nil if and only if OBJECT is a macro."
+    (let ((def (indirect-function object)))
+      (and (consp def) (eq (car def) 'macro) t))))
+
+(unless (fboundp 'commandp)
+  (defun commandp (function &optional for-call-interactively)
+    "Non-nil if FUNCTION makes provisions for interactive calling.
+This means it contains a description for how to read arguments to give
+it.  The value is nil for an invalid function or a symbol with no
+function definition.
+
+Interactively callable functions include strings and vectors (treated
+as keyboard macros) and lambda-expressions that contain a top-level
+call to `interactive'.  Also, a symbol satisfies `commandp' if its
+function definition does so.
+
+If the optional argument FOR-CALL-INTERACTIVELY is non-nil, then
+strings and vectors are not accepted."
+    (let ((fun (indirect-function function)))
+      (cond
+       ((null fun) nil)
+       ((or (stringp fun) (vectorp fun)) (and (not for-call-interactively) t))
+       ((not (consp fun)) nil)
+       ((eq (car fun) 'lambda) (and (assq 'interactive (cdr (cdr fun))) t))
+       ((eq (car fun) 'closure) (and (assq 'interactive (cdr (cdr (cdr fun)))) t))
+       (t nil)))))
 
 ;; ---- Doc 22 reader-core gap fix A9 + with-output-to-string ----
 ;;

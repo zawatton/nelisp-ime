@@ -9814,6 +9814,83 @@ baked build's own `<'/`>'/`=' arms need it too.")
       (if (= (nl_intern_lookup (bf_str_ptr sx) (bf_str_len sx) out) 0)
           (wf_write_nil out)
         0))
+    ;; OBARRAY argument of `intern' / `intern-soft'.  This runtime has one
+    ;; global intern table and no obarray object, so the only OBARRAY it can
+    ;; honour is nil or absent; Emacs type-checks the argument, so a non-nil
+    ;; one signals (wrong-type-argument obarrayp OBARRAY) exactly as there.
+    ;; Returns 1 when it signalled, 0 when the argument is acceptable.
+    (defun bf_obarray_arg_bad (args)
+      (if (= (ptr-read-u64 (nl_cons_cdr_ptr args) 0) 7)
+          (if (= (ptr-read-u64 (wf_arg_ptr args 1) 0) 0)
+              0
+            (bf_wrong_type_named (wf_arg_ptr args 1) 8104616148603069039 0 0 8))
+        0))
+    ;; ---- `format' fast path (2026-09-06) ----
+    ;; The prelude `format' adds Emacs's field-width / flags / precision
+    ;; layer and argument type checks in interpreted elisp, walking the
+    ;; template one character at a time and re-`concat'ing the output for
+    ;; every piece.  That layer cost 200 us for (format "abc") and 1.4 ms for
+    ;; (format "sym-%d" i) against 14 us / 27 us for the native arm -- and
+    ;; `format' is under `message', `error', `cl-defstruct' accessor names,
+    ;; `define-minor-mode' hook names and most macro-generated symbols.  The
+    ;; ~1000x-slower-than-Emacs `(intern (format ...))' that T77 measured
+    ;; was this wrapper; the intern table itself is a flat open-addressing
+    ;; hash (lisp/nelisp-cc-nlstr-direct-ops.el) and costs ~4 us a probe.
+    ;;
+    ;; `bf_fmt_simple_scan' decides in one native pass whether the native
+    ;; formatter produces exactly what the elisp layer produces: every
+    ;; directive is one of %s %d %i %o %x %X %c %% with no flag, width or
+    ;; precision; every arg-consuming directive has an argument; the numeric
+    ;; directives get a fixnum (a float needs Emacs's truncation, a
+    ;; non-number must signal) and %c a fixnum in the character range; and
+    ;; neither the template nor a consumed argument is a raw-byte string
+    ;; (the concat-of-pieces path and the one-shot path differ there).
+    ;; Anything else declines (0) and the caller runs the full elisp layer,
+    ;; so every signal and edge case stays exactly where it was.  The scan
+    ;; is also what makes `m5_fmt_loop' safe to call: the loop itself never
+    ;; checks that an argument exists, and (nelisp--native-format "%s %s"
+    ;; "one") reads the nil tail as a cons and faults.
+    (defun bf_fmt_simple_char_ok (a)
+      (if (= (ptr-read-u64 a 0) 2)
+          (if (< (ptr-read-u64 a 8) 0) 0
+            (if (< 4194303 (ptr-read-u64 a 8)) 0 1))
+        0))
+    (defun bf_fmt_simple_arg_ok (d a)
+      (if (= (m5_unibyte_tag_p (ptr-read-u64 a 0)) 1) 0
+        (if (= d 115) 1
+          (if (= d 99) (bf_fmt_simple_char_ok a)
+            (if (= (ptr-read-u64 a 0) 2) 1 0)))))
+    (defun bf_fmt_simple_conv_p (d)
+      (if (= d 115) 1
+        (if (= d 100) 1
+          (if (= d 105) 1
+            (if (= d 111) 1
+              (if (= d 120) 1
+                (if (= d 88) 1
+                  (if (= d 99) 1 0))))))))
+    (defun bf_fmt_simple_scan (fmt i n argp)
+      (if (>= i n) 1
+        (if (= (m5_byte_at fmt i) 37)
+            (if (>= (+ i 1) n) 0
+              (let* ((d (m5_byte_at fmt (+ i 1))))
+                (if (= d 37)
+                    (bf_fmt_simple_scan fmt (+ i 2) n argp)
+                  (if (= (bf_fmt_simple_conv_p d) 0) 0
+                    (if (= (ptr-read-u64 argp 0) 7)
+                        (if (= (bf_fmt_simple_arg_ok d (nl_cons_car_ptr argp)) 1)
+                            (bf_fmt_simple_scan fmt (+ i 2) n (nl_cons_cdr_ptr argp))
+                          0)
+                      0)))))
+          (bf_fmt_simple_scan fmt (+ i 1) n argp))))
+    (defun bf_format_simple (fmt argl out)
+      (if (= (m5_string_tag_p (ptr-read-u64 fmt 0)) 0) (wf_write_nil out)
+        (if (= (m5_unibyte_tag_p (ptr-read-u64 fmt 0)) 1) (wf_write_nil out)
+          (if (= (bf_fmt_simple_scan fmt 0 (m5_strlen fmt) argl) 0) (wf_write_nil out)
+            (let* ((ms (alloc-bytes 32 8)))
+              (seq (m5_make_builder ms 32 0)
+                   (m5_fmt_loop ms fmt 0 (m5_strlen fmt) argl)
+                   (mut-str-finalize ms out)
+                   0))))))
     ;; Doc 22 A11: `make-symbol' must yield a symbol with DISTINCT identity.
     ;; This reader has no obarray -- variable lookup and `eq' compare symbols by
     ;; NAME (name == identity, see bf_eq2 tag-4 arm), so routing make-symbol
@@ -12320,7 +12397,12 @@ Wave-2 (C) appends bf_ash (shl/sar compose) + bf_str_lt (byte-lexicographic).")
     ;; name buffer just as happily as a Str's.  Emacs signals, and a caller
     ;; that interned something already interned was almost certainly working
     ;; from a wrong assumption about what it held.
-    ((:lit "intern")      . (let* ((a (wf_arg_ptr args 0)) (tg (ptr-read-u64 a 0)))
+    ;; The OBARRAY argument is type-checked here (`bf_obarray_arg_bad')
+    ;; rather than by a prelude wrapper: the wrapper was one more interpreted
+    ;; call on every `intern' -- 22 us of a 26 us hit on a 4 us native probe,
+    ;; measured 2026-09-06 -- and every macro-generated name pays it.
+    ((:lit "intern")      . (if (= (bf_obarray_arg_bad args) 1) 1
+                             (let* ((a (wf_arg_ptr args 0)) (tg (ptr-read-u64 a 0)))
                               (if (if (= tg 5) 1 (if (= tg 6) 1 (if (= tg 14) 1 (if (= tg 15) 1 0))))
                                   ;; An existing intern is a lookup, not a
                                   ;; mutation.  Only the miss that would insert
@@ -12335,7 +12417,20 @@ Wave-2 (C) appends bf_ash (shl/sar compose) + bf_str_lt (byte-lexicographic).")
                                           1
                                         (seq (bf_intern a out) 0))
                                     0)
-                                (bf_wrong_type_stringp a))))
+                                (bf_wrong_type_stringp a)))))
+    ;; `intern-soft' natively (2026-09-06).  A symbol (nil and t included)
+    ;; answers itself -- name identity is symbol identity here, see Doc 163
+    ;; sec 8.3 -- a string probes the table without inserting, anything else
+    ;; signals `stringp' as Emacs does.  Replaces the prelude defun, which
+    ;; was two interpreted calls (its own and `nelisp--intern-lookup') on
+    ;; every probe.
+    ((:lit "intern-soft") . (if (= (bf_obarray_arg_bad args) 1) 1
+                             (let* ((a (wf_arg_ptr args 0)) (tg (ptr-read-u64 a 0)))
+                               (if (if (= tg 4) 1 (if (= tg 0) 1 (if (= tg 1) 1 0)))
+                                   (wf_copy32 out a)
+                                 (if (if (= tg 5) 1 (if (= tg 6) 1 (if (= tg 14) 1 (if (= tg 15) 1 0))))
+                                     (bf_intern_soft a out)
+                                   (bf_wrong_type_stringp a))))))
     ((:lit "make-symbol") . (seq (bf_make_symbol (wf_arg_ptr args 0) out) 0))
     ;; nelisp--intern-lookup: probe-only counterpart of `intern' (Doc 163
     ;; Phase C).  `bf_intern_soft' already returns 0 on both the hit and
@@ -12343,6 +12438,11 @@ Wave-2 (C) appends bf_ash (shl/sar compose) + bf_str_lt (byte-lexicographic).")
     ;; needed here (unlike `intern', whose `bf_intern' returns a non-zero
     ;; slot pointer).  Backs the elisp `intern-soft' (lisp/nelisp-stdlib-misc.el).
     ((:lit "nelisp--intern-lookup") . (bf_intern_soft (wf_arg_ptr args 0) out))
+    ;; nelisp--format-simple TEMPLATE ARGS: the finished string when the
+    ;; native formatter is known to agree with the prelude `format' layer
+    ;; for this call, else nil (see `bf_format_simple').  Called by the
+    ;; prelude `format' before its interpreted field-width/type-check layer.
+    ((:lit "nelisp--format-simple") . (bf_format_simple (wf_arg_ptr args 0) (wf_arg_ptr args 1) out))
     ;; A BYTE is 0..255.  Anything else was taken modulo 256 and became a
     ;; different character: (unibyte-string 300) answered "," rather than
     ;; signalling, so a caller building a byte string from computed values
@@ -12403,6 +12503,7 @@ Wave-2 (C) appends bf_ash (shl/sar compose) + bf_str_lt (byte-lexicographic).")
     ((:lit "nelisp--syscall-lstat-buf") . (nl_bi_syscall_lstat_buf args out))
     ((:lit "nelisp--syscall-readlink") . (nl_bi_syscall_readlink args out))
     ((:lit "nelisp--syscall-readdir-names") . (nl_bi_syscall_readdir_names args out))
+    ((:lit "nelisp--readdir-scan-raw") . (nl_bi_readdir_scan_raw args out))
     ((:lit "nelisp--syscall-utimes") . (nl_bi_syscall_utimes args out))
     ((:lit "nelisp--syscall-statx-buf") . (nl_bi_syscall_statx_buf args out))
     ((:lit "nelisp--syscall-unshare") . (nl_bi_syscall_unshare args out))
@@ -12544,7 +12645,8 @@ ash/logand/logior/logxor/lognot + string<.")
   '("consp" "atom" "stringp" "symbolp" "integerp" "bignump" "natnump" "numberp" "floatp"
     "nl--read-int" "nl--int-token-p" "nl--nthcdr"
     "vectorp" "listp" "zerop" "set" "symbol-value" "fboundp" "boundp" "featurep" "provide" "require"
-    "symbol-name" "intern" "make-symbol" "nelisp--intern-lookup" "unibyte-string"
+    "symbol-name" "intern" "intern-soft" "make-symbol" "nelisp--intern-lookup"
+    "nelisp--format-simple" "unibyte-string"
     "make-vector" "vector" "aref" "elt" "aset" "record" "recordp" "make-record"
     ;; Doc 186 P0/P1/P2: char-table constructor/accessor layer.
     "char-table-p" "make-char-table" "char-table-subtype"
@@ -14510,17 +14612,15 @@ Other targets return nil, preserving their generated process source exactly."
         (if (< n 0)
             (wf_write_nil out)
           (nl_seq2 (nl_alloc_str buf n out) 0))))
-    ;; nelisp--syscall-readdir-names PATH: openat(O_RDONLY|O_DIRECTORY) +
-    ;; getdents64 + close -- return every entry name in PATH as one
-    ;; newline-joined string ("." / ".." included; callers filter), or nil
-    ;; when PATH cannot be opened as a directory.  One flat string keeps the
-    ;; builtin list-free (same return shape as readlink / read-file).
+    ;; Directory enumeration's primitive boundary stays flat and allocation
+    ;; free while getdents64 is live.  SEP remains newline for existing
+    ;; callers and is NUL for directory operations that opt into the
+    ;; collision-free form.
     ;; dirent64 layout: d_ino@0 d_off@8 d_reclen(u16)@16 d_type(u8)@18
     ;; d_name@19 (NUL-terminated).  Output is clipped at 65535 bytes.
     ;; Pure elisp, no new Rust.
-    (defun nl_bi_syscall_readdir_names (args out)
-      (let* ((path_sx (wf_arg_ptr args 0))
-             (cpath (nl_bi_make_cpath path_sx))
+    (defun nl_bi_syscall_readdir_buffer (path_sx sep out)
+      (let* ((cpath (nl_bi_make_cpath path_sx))
              (fd (nl_os_open_dir cpath)))
         (if (< fd 0)
             (wf_write_nil out)
@@ -14550,13 +14650,83 @@ Other targets return nil, preserving their generated process source exactly."
                                   (setq np (+ np 1))))
                                (if (< slen 65536)
                                    (seq
-                                    (ptr-write-u8 sbuf slen 10)
+                                    (ptr-write-u8 sbuf slen sep)
                                     (setq slen (+ slen 1)))
                                  0)
                                (setq pos (+ pos reclen))))))))
                   0)))
              (nl_os_close_dir fd)
              (nl_seq2 (nl_alloc_str sbuf slen out) 0))))))
+    (defun nl_bi_syscall_readdir_names (args out)
+      (let* ((rest (nl_cons_cdr_ptr args))
+             (nul-separated
+              (if (= (ptr-read-u64 rest 0) 7)
+                  (if (= (ptr-read-u64 (nl_cons_car_ptr rest) 0) 0) 0 1)
+                0)))
+        (nl_bi_syscall_readdir_buffer
+         (wf_arg_ptr args 0) (if (= nul-separated 1) 0 10) out)))
+    ;; Decode one flat readdir buffer natively.  Build the list tail-forward
+    ;; while scanning byte offsets so there is neither an interpreted `aref'
+    ;; per byte nor a reversal pass.  `nl_alloc_str' copies exact UTF-8 byte
+    ;; slices, preserving multibyte names.
+    (defun nl_readdir_dot_entry_p (ptr start n)
+      (if (= n 1)
+          (if (= (ptr-read-u8 ptr start) 46) 1 0)
+        (if (= n 2)
+            (if (= (ptr-read-u8 ptr start) 46)
+                (if (= (ptr-read-u8 ptr (+ start 1)) 46) 1 0)
+              0)
+          0)))
+    (defun nl_readdir_scan_raw (raw sep skip-dotdot out)
+      (let* ((ptr (bf_str_ptr raw))
+             (len (bf_str_len raw))
+             (idx 0)
+             (start 0)
+             (have 0)
+             (tail (alloc-bytes 32 8))
+             (node (alloc-bytes 32 8))
+             (name (alloc-bytes 32 8))
+             (nil-slot (alloc-bytes 32 8)))
+        (seq
+         (wf_write_nil out)
+         (wf_write_nil tail)
+         (wf_write_nil nil-slot)
+         (while (< idx len)
+           (seq
+            (if (= (ptr-read-u8 ptr idx) sep)
+                (let* ((n (- idx start)))
+                  (seq
+                   (if (if (= skip-dotdot 0)
+                           1
+                         (if (= (nl_readdir_dot_entry_p ptr start n) 1) 0 1))
+                       (seq
+                        (nl_alloc_str (+ ptr start) n name)
+                        (nelisp_cons_construct name nil-slot node)
+                        (if (= have 0)
+                            (seq
+                             (wf_copy32 out node)
+                             (wf_copy32 tail node)
+                             (setq have 1))
+                          (seq
+                           (cons-set-cdr tail node)
+                           (wf_copy32 tail node))))
+                     0)
+                   (setq start (+ idx 1))))
+              0)
+            (setq idx (+ idx 1))))
+         0)))
+    (defun nl_bi_readdir_scan_raw (args out)
+      (let* ((rest1 (nl_cons_cdr_ptr args))
+             (rest2 (nl_cons_cdr_ptr rest1))
+             (nul-separated
+              (if (= (ptr-read-u64 rest2 0) 7)
+                  (if (= (ptr-read-u64 (nl_cons_car_ptr rest2) 0) 0) 0 1)
+                0)))
+        (nl_readdir_scan_raw
+         (wf_arg_ptr args 0)
+         (if (= nul-separated 1) 0 10)
+         (ptr-read-u64 (wf_arg_ptr args 1) 0)
+         out)))
     ;; nelisp--syscall-utimes PATH ATIME MTIME: utimes(2) (syscall 235) -- set
     ;; the access + modification times to ATIME / MTIME (seconds; usec = 0).
     ;; Builds a struct timeval[2] {atime.sec, atime.usec, mtime.sec, mtime.usec}
@@ -17379,7 +17549,7 @@ value (matches the binary's M8 read+eval-loop driver)."
     "nelisp--syscall-path" "nelisp--syscall-path2" "nelisp--syscall-path-int"
     "nelisp--syscall-stat-field" "nelisp--syscall-stat-buf"
     "nelisp--syscall-lstat-buf" "nelisp--syscall-readlink"
-    "nelisp--syscall-readdir-names"
+    "nelisp--syscall-readdir-names" "nelisp--readdir-scan-raw"
     "nelisp--syscall-utimes" "nelisp--syscall-statx-buf" "nelisp--syscall-unshare"
     "nelisp--syscall-mount" "nelisp--syscall-pivot-root"
     "nelisp--write-stdout-bytes" "nelisp--write-stderr-line"
@@ -17391,7 +17561,8 @@ value (matches the binary's M8 read+eval-loop driver)."
     "consp" "atom" "stringp" "symbolp" "integerp" "bignump" "natnump" "numberp" "floatp"
     "nl--read-int" "nl--int-token-p" "nl--nthcdr"
     "vectorp" "listp" "zerop" "set" "symbol-value" "fboundp" "boundp" "featurep" "provide" "require"
-    "symbol-name" "intern" "make-symbol" "nelisp--intern-lookup" "unibyte-string"
+    "symbol-name" "intern" "intern-soft" "make-symbol" "nelisp--intern-lookup"
+    "nelisp--format-simple" "unibyte-string"
     "make-vector" "vector" "aref" "elt" "aset" "record" "recordp" "make-record"
     ;; Doc 186 P0/P1/P2: char-table constructor/accessor layer.
     "char-table-p" "make-char-table" "char-table-subtype"
@@ -19748,6 +19919,103 @@ the native stack."
        (seq
         ,@(nreverse forms)
         (+ off ,len)))))
+
+(defun nelisp-standalone--elisp-strip-comments (text)
+  "Return TEXT with every `;' line comment removed, syntax-aware.
+This exists to shrink `nelisp-standalone--reader-repl-prelude-source'
+before it is handed to `nelisp-standalone--copy-lit-u64-defuns': that
+function turns every 8 bytes of its STRING argument into a native
+`ptr-write-u64' store (`nl_repl_prelude_source_chunk_NNN'), so every
+byte of comment prose in the prelude is paid for at ~6x its size in
+compiled code.  Doc-T60's size audit measured ~27% of the prelude's raw
+source as comments and blank lines.
+
+Only `;' characters the Elisp reader would actually treat as starting a
+comment are removed:
+
+- A `;' inside a string (honoring backslash escapes, so `\\\"' never
+  closes the string early) is left alone -- this is what keeps
+  docstrings untouched, since a docstring is an ordinary string to
+  this scan and every byte of one, semicolons included, survives.
+- A `;' that is the second character of a character literal -- the
+  backslash form `?\\;' (already covered generically: `\\' always
+  escapes exactly the next character, in or out of a string) and the
+  bare form `?;' (a lone `?' not immediately followed by `\\' always
+  starts a 2-character literal, so the very next raw character, `;' or
+  otherwise, is taken as the constant rather than re-examined) -- is
+  left alone too.
+- A `#@N' byte-compiler docstring-skip marker, if the concatenated
+  source ever contains one, is passed through with its N-byte payload
+  completely unexamined (same shape as the skip in
+  `nelisp--rd-skip-ws', a few thousand lines above, in the prelude
+  source this strips: N counts bytes starting right after the decimal
+  digits, no separator byte). Ordinary hand-written .el source never
+  contains this construct; it only exists in byte-compiler output, so
+  this branch is defensive.
+
+A comment's own terminating newline is always kept -- this function
+never deletes a newline, comment-only or otherwise blank lines
+included, so every surviving line keeps the same line number it had in
+TEXT.  That matters here because `nl_eval_source_all' counts newlines
+while it parses the embedded prelude and passes the running count as
+`line_no' to `nl_eval_source_print_error' on an eval error: shifting
+line numbers would make a rare prelude-load error harder to place in
+the source for a byte savings of about one byte per blank line, far
+short of the bulk of the savings, which is the comment prose itself.
+Horizontal whitespace directly before a stripped comment is trimmed
+along with it (a comment-only line, indentation included, becomes a
+bare newline); this cannot merge tokens because the kept newline (or
+EOF) still delimits whatever came before from whatever comes next."
+  (let* ((len (length text))
+         (i 0)
+         (start 0)
+         (chunks nil))
+    (cl-flet ((flush (upto)
+                (when (> upto start)
+                  (push (substring text start upto) chunks))))
+      (while (< i len)
+        (let ((c (aref text i)))
+          (cond
+           ;; `\' escapes exactly the next character, everywhere -- inside
+           ;; or outside a string, whether or not it follows a `?'.
+           ((eq c ?\\)
+            (setq i (min len (+ i 2))))
+           ;; A `?' not immediately followed by `\' starts a 2-character
+           ;; literal (`?;', `?"', `??', ...): the reader takes the very
+           ;; next raw character as the constant, never as comment/string
+           ;; syntax, regardless of what it is.
+           ((and (eq c ??)
+                 (< (1+ i) len)
+                 (not (eq (aref text (1+ i)) ?\\)))
+            (setq i (+ i 2)))
+           ((eq c ?\")
+            (setq i (1+ i))
+            (while (and (< i len) (not (eq (aref text i) ?\")))
+              (setq i (if (eq (aref text i) ?\\) (+ i 2) (1+ i))))
+            (setq i (min len (1+ i))))
+           ;; `#@N': byte-compiler docstring skip -- copy the digits, then
+           ;; the N bytes right after them, through unexamined.
+           ((and (eq c ?#)
+                 (< (+ i 2) len)
+                 (eq (aref text (1+ i)) ?@)
+                 (<= ?0 (aref text (+ i 2)) ?9))
+            (let ((j (+ i 2)) (count 0))
+              (while (and (< j len) (<= ?0 (aref text j) ?9))
+                (setq count (+ (* count 10) (- (aref text j) ?0))
+                      j (1+ j)))
+              (setq i (min len (+ j count)))))
+           ((eq c ?\;)
+            (let ((trim i))
+              (while (and (> trim start)
+                          (memq (aref text (1- trim)) '(?\s ?\t)))
+                (setq trim (1- trim)))
+              (flush trim))
+            (while (and (< i len) (not (eq (aref text i) ?\n)))
+              (setq i (1+ i)))
+            (setq start i))
+           (t (setq i (1+ i))))))
+      (flush len))
+    (apply #'concat (nreverse chunks))))
 
 (defun nelisp-standalone--copy-lit-u64-defuns (name string &optional chunk-bytes)
   "Return Phase47 defuns copying large literal STRING into DST at OFF.
@@ -23330,7 +23598,8 @@ correctly."
       "(nelisp--repl-idle-pump)")
     ,@(nelisp-standalone--copy-lit-u64-defuns
       'nl_repl_prelude_source
-      (nelisp-standalone--reader-repl-prelude-source))
+      (nelisp-standalone--elisp-strip-comments
+       (nelisp-standalone--reader-repl-prelude-source)))
     (defun nl_runtime_image_command_p (ptr)
       (if (= (nl_cstr_eq_dump_runtime_image ptr) 1)
           1
@@ -28264,7 +28533,8 @@ its header for the `cat PRELUDE yourfile.el | binary' usage.")
 
 (defun nelisp-standalone--prelude-breadth-test-src ()
   "Breadth test exercising the Wave-1 (B) primitives + the prelude macros.
-Returns 42: defun+cond, dolist+setq, nth, plist-get, and a backquote `length'
+Returns 42: defun+cond, dolist+setq, nth, plist-get, `fboundp'/`macrop'/
+`commandp'/`indirect-function' accepting nil, and a backquote `length'
 all combine so a single wrong primitive shifts the result off 42."
   (concat
    "(defun bt-f (x) (cond ((< x 0) 0) (t (* x 2))))\n"
@@ -28284,6 +28554,37 @@ all combine so a single wrong primitive shifts the result off 42."
    "       (if (string= (nelisp-format-hexfloat 1.5 0) \"0x2p+0\") 0 100)\n"
    "       (if (string= (nelisp-format-hexfloat 1.0 nil t) \"0X1P+0\") 0 100)\n"
    "       (if (string= (nelisp-format-hexfloat 0.0) \"0x0p+0\") 0 100)\n"
+   ;; Doc 159 SS15: `nelisp--prn-float' is now a direct `number-to-string'
+   ;; passthrough (the `string-search'-based surgery it used to run was
+   ;; redundant and ~200x the cost of the single native call it wrapped).
+   ;; These pin the exact Emacs spellings that passthrough depends on
+   ;; staying correct, and the wall-time bound is a regression guard
+   ;; against the surgery (or anything as slow) coming back: 3000 floats
+   ;; through `prin1-to-string' individually took double-digit SECONDS
+   ;; before this fix and comfortably under one after it, so 4s is loose
+   ;; in the direction that matters (never flakes green-to-red on a slow
+   ;; CI runner) while still catching an O(n) 200x-per-value regression.
+   "       (if (string= (prin1-to-string 5.0) \"5.0\") 0 100)\n"
+   "       (if (string= (prin1-to-string 1.23) \"1.23\") 0 100)\n"
+   "       (if (string= (prin1-to-string -0.0) \"-0.0\") 0 100)\n"
+   "       (if (string= (prin1-to-string 1e20) \"1e+20\") 0 100)\n"
+   "       (if (string= (prin1-to-string (/ 1.0 0.0)) \"1.0e+INF\") 0 100)\n"
+   "       (if (string= (prin1-to-string (/ 0.0 0.0)) \"-0.0e+NaN\") 0 100)\n"
+   "       (if (let* ((n 3000) (i 0) (s (float-time)) (acc 0))\n"
+   "             (while (< i n)\n"
+   "               (setq acc (+ acc (length (prin1-to-string (/ (float i) 7.0)))))\n"
+   "               (setq i (1+ i)))\n"
+   "             (and (> acc 0) (< (- (float-time) s) 4.0)))\n"
+   "           0 100)\n"
+   ;; nil/t are symbols (a never-fset function cell, same as any other
+   ;; never-bound symbol) -- these four used to signal `(wrong-type-
+   ;; argument symbolp nil)' instead of answering nil like GNU Emacs.
+   "       (if (eq (fboundp nil) nil) 0 100)\n"
+   "       (if (eq (fboundp 'car) t) 0 100)\n"
+   "       (if (eq (macrop nil) nil) 0 100)\n"
+   "       (if (eq (commandp nil) nil) 0 100)\n"
+   "       (if (eq (commandp \"kbd\") t) 0 100)\n"
+   "       (if (eq (indirect-function nil) nil) 0 100)\n"
    "       (if (= (length `(1 ,b ,@c 5)) 5) 42 100))))\n")) ; backquote length 5 -> 42
 
 ;;;###autoload

@@ -1086,6 +1086,7 @@ STANDALONE_READER_SMOKES = \
   standalone-reader-pcase-quote-literal-smoke \
   standalone-reader-prelude-equal-reload-smoke \
   standalone-reader-prelude-test \
+  standalone-reader-print-large-sexp-smoke \
   standalone-reader-process-adapter-smoke \
   standalone-reader-process-adapter-smoke-red \
   standalone-reader-process-smoke \
@@ -1423,13 +1424,20 @@ standalone-reader-winpath-smoke: $(if $(wildcard target/nelisp target/nelisp.exe
 standalone-reader-fileattrs-smoke: $(if $(wildcard target/nelisp target/nelisp.exe),,standalone-reader)
 	@bin=$(STANDALONE_BIN); \
 	d=target/tmp/fileattrs-smoke; \
-	rm -rf $$d; mkdir -p $$d/sub; \
+	rm -rf $$d; mkdir -p $$d/sub $$d/empty $$d/many; \
 	printf '0123456789' > $$d/ten-bytes.txt; \
+	touch $$d/.hidden $$d/日本語-😀.txt; \
+	seq -w 0 999 | xargs -I{} touch $$d/many/entry-{}; \
+	$(EMACS) --batch -Q --eval \
+	  '(write-region "" nil "target/tmp/fileattrs-smoke/line\nbreak" nil (quote silent))' \
+	  >/dev/null; \
 	dir="$$(pwd -W 2>/dev/null || pwd)/$$d"; \
 	printf '%s\n' \
 	  "(let* ((dir \"$$dir\")" \
 	  '       (f (concat dir "/ten-bytes.txt"))' \
 	  '       (sub (concat dir "/sub"))' \
+	  '       (empty (concat dir "/empty"))' \
+	  '       (many (concat dir "/many"))' \
 	  '       (attrs (file-attributes f))' \
 	  '       (mtime (file-attribute-modification-time attrs))' \
 	  '       (size-ok (equal (file-attribute-size attrs) 10))' \
@@ -1437,13 +1445,50 @@ standalone-reader-fileattrs-smoke: $(if $(wildcard target/nelisp target/nelisp.e
 	  '       (reg-ok (and (file-regular-p f) (not (file-directory-p f))))' \
 	  '       (dir-ok (and (file-directory-p sub) (not (file-regular-p sub))))' \
 	  '       (names (directory-files dir))' \
-	  '       (names-ok (and (= (length names) 2) (and (member "sub" names) t)' \
-	  '                      (and (member "ten-bytes.txt" names) t)))' \
+	  '       (all-names (cdr (nelisp--syscall-readdir dir)))' \
+	  '       (many-names (directory-files many nil nil t))' \
+	  '       (many-raw (nelisp--syscall-readdir-names many))' \
+	  '       (many-decoded (nelisp--readdir-scan-raw many-raw t))' \
+	  '       (perf-reps 20)' \
+	  '       (perf-i 0)' \
+	  '       (perf-value nil)' \
+	  '       (raw-t0 (float-time))' \
+	  '       (raw-loop (while (< perf-i perf-reps)' \
+	  '                   (setq perf-value (nelisp--syscall-readdir-names many))' \
+	  '                   (setq perf-i (1+ perf-i))))' \
+	  '       (raw-usec (/ (* (- (float-time) raw-t0) 1000000.0) perf-reps))' \
+	  '       (perf-i 0)' \
+	  '       (public-t0 (float-time))' \
+	  '       (public-loop (while (< perf-i perf-reps)' \
+	  '                      (setq perf-value (directory-files many nil nil t))' \
+	  '                      (setq perf-i (1+ perf-i))))' \
+	  '       (public-usec (/ (* (- (float-time) public-t0) 1000000.0) perf-reps))' \
+	  '       (perf-ratio (if (> raw-usec 0.0) (/ public-usec raw-usec) 99999.0))' \
+	  '       (perf-ok (< perf-ratio 20.0))' \
+	  '       (names-ok (and (= (length names) 7)' \
+	  '                      (and (member "sub" names) t)' \
+	  '                      (and (member "empty" names) t)' \
+	  '                      (and (member "many" names) t)' \
+	  '                      (and (member "ten-bytes.txt" names) t)' \
+	  '                      (and (member ".hidden" names) t)' \
+	  '                      (and (member "日本語-😀.txt" names) t)' \
+	  '                      (and (member "line\nbreak" names) t)' \
+	  '                      (not (member "." names))' \
+	  '                      (not (member ".." names))))' \
+	  '       (dot-ok (and (= (length all-names) 9)' \
+	  '                    (and (member "." all-names) t)' \
+	  '                    (and (member ".." all-names) t)))' \
+	  '       (empty-ok (null (directory-files empty)))' \
+	  '       (many-ok (and (= (length many-names) 1000)' \
+	  '                     (and (member "entry-000" many-names) t)' \
+	  '                     (and (member "entry-999" many-names) t)' \
+	  '                     (equal many-names many-decoded)))' \
 	  '       (absent-ok (and (null (file-attributes (concat dir "/nope")))' \
 	  '                       (null (directory-files (concat dir "/nope"))))))' \
-	  '  (princ (format "size-ok=%S mtime=%S reg-ok=%S dir-ok=%S names=%S absent-ok=%S pass=%S\n"' \
-	  '                 size-ok mtime reg-ok dir-ok names absent-ok' \
-	  '                 (and size-ok mtime-ok reg-ok dir-ok names-ok absent-ok))))' \
+	  '  (princ (format "size-ok=%S mtime=%S reg-ok=%S dir-ok=%S names-ok=%S dot-ok=%S empty-ok=%S many=%d order-ok=%S perf=%.2fx absent-ok=%S pass=%S\n"' \
+	  '                 size-ok mtime reg-ok dir-ok names-ok dot-ok empty-ok' \
+	  '                 (length many-names) (equal many-names many-decoded) perf-ratio absent-ok' \
+	  '                 (and size-ok mtime-ok reg-ok dir-ok names-ok dot-ok empty-ok many-ok perf-ok absent-ok))))' \
 	  > target/standalone-reader-fileattrs-smoke.el; \
 	out="$$($$bin --load target/standalone-reader-fileattrs-smoke.el 2>&1)"; \
 	case "$$out" in \
@@ -1483,6 +1528,7 @@ standalone-reader-regexp-lead-filter-smoke: $(if $(wildcard target/nelisp target
 	mkdir -p target; \
 	printf '%s\n' \
 	  '(let* ((got (list (string-match "abc" "xxabcyy")' \
+	  '                  (string-match "abc+" "xxabcc")' \
 	  '                  (string-match "abc" "xxabxx")' \
 	  '                  (let ((case-fold-search t)) (string-match "ABC" "xxabc"))' \
 	  '                  (let ((case-fold-search nil)) (string-match "ABC" "xxabc"))' \
@@ -1491,7 +1537,7 @@ standalone-reader-regexp-lead-filter-smoke: $(if $(wildcard target/nelisp target
 	  '                  (string-match "x" "")' \
 	  '                  (string-match "" "abc")' \
 	  '                  (string-match "b" "abc" 2)))' \
-	  '       (want (list 2 nil 2 nil 2 0 nil 0 nil))' \
+	  '       (want (list 2 2 nil 2 nil 2 0 nil 0 nil))' \
 	  '       (r6 (string-match "\\(a+\\)\\(b+\\)" "zzaabbb"))' \
 	  '       (g1 (list (match-beginning 1) (match-end 1)' \
 	  '                 (match-beginning 2) (match-end 2)))' \
@@ -2092,6 +2138,23 @@ standalone-reader-recursion-guard-smoke: standalone-reader
 	@bin=$(STANDALONE_BIN); \
 	timeout 180 $$bin --load tools/recursion-guard-smoke.el
 
+# `prin1-to-string' on the shapes a consumer actually serialises: a long
+# flat list, a vector of floats, a deep nest.  Added 2026-09-05 after
+# nelisp-llm reported exit 139 while printing a ~155k-float checkpoint on a
+# d145e3c02 build.  That death was the conservative-pin defect e240485bb
+# closed (see docs and the report of that fix); the printer itself walks list
+# spines with a loop and was never the faulting frame.  This smoke pins the
+# contract on the shipped binary anyway -- exact printed length, `equal'
+# read-back, exact deep-nest text, `print-level' cap -- so a printer that
+# started recursing per element, truncating, or dropping separators is one
+# red line here rather than a consumer's corrupt checkpoint.  Sizes are
+# bounded for the smoke budget; the 100k-element / ~700 KB twin lives in
+# test/nelisp-stdlib-test.el where host Emacs runs the same printer source.
+.PHONY: standalone-reader-print-large-sexp-smoke
+standalone-reader-print-large-sexp-smoke: standalone-reader
+	@bin=$(STANDALONE_BIN); \
+	timeout 180 $$bin --load tools/print-large-sexp-smoke.el
+
 # The environment, read back through `getenv' from a child that was given
 # one.  Written on wip/uncommitted-2026-08-18 by whoever first noticed that
 # `getenv' answered nil, and brought over here with the fix rather than
@@ -2117,6 +2180,12 @@ standalone-reader-recursion-guard-smoke: standalone-reader
 #   5 `rdf' answers nil for a file it cannot open, "" only for an empty one.
 #   6 `encode-coding-string' / `decode-coding-string' are a real
 #     unibyte/multibyte pair, not the identity.
+#   7 `exp' at an extreme argument answers 0.0 / +inf, not a multi-second
+#     hang or NaN (dev/BUG-nelisp-standalone-exp-streams-sigsegv-2026-09-05.md
+#     section 1; scripts/nelisp-stdlib-prelude.el's `exp' used an O(|k|)
+#     scaling loop with k unbounded in |x|, so `(exp -1.0e6)' took over 10s
+#     and `(exp -1.0e30)' answered NaN from k overflowing `truncate''s i64
+#     range).
 #
 # Each assertion is a VALUE, not an exit status: every one of these answered
 # something plausible-looking before, which is exactly why they survived a
@@ -2172,7 +2241,39 @@ standalone-reader-host-parity-smoke: standalone-reader
 	else \
 	  echo "[host-parity] FAIL: kill-emacs exit status $$rc (expected 7)"; exit 1; \
 	fi
-	@echo "[standalone-reader-host-parity-smoke] PASS: all six v1.2.0 host-parity gaps"
+	@printf '%s\n' \
+	  '(setq r-exp-u30 (= (exp -1.0e30) 0.0))' \
+	  '(setq r-exp-u9 (= (exp -1.0e9) 0.0))' \
+	  '(setq r-exp-u6 (= (exp -1.0e6) 0.0))' \
+	  '(setq r-exp-745 (= (exp -745.0) 4.9406564584124654e-324))' \
+	  '(setq r-exp-n700 (= (exp -700.0) 9.85967654375977e-305))' \
+	  '(setq r-exp-o (= (exp 710.0) (/ 1.0 0.0)))' \
+	  '(setq r-exp-nan (let ((v (exp (/ 0.0 0.0)))) (/= v v)))' \
+	  '(list r-exp-u30 r-exp-u9 r-exp-u6 r-exp-745 r-exp-n700 r-exp-o r-exp-nan)' \
+	  > target/standalone-reader-host-parity-exp.el
+	@out="$$($(STANDALONE_BIN) --load target/standalone-reader-host-parity-exp.el)"; \
+	expected='(t t t t t t t)'; \
+	if [ "$$out" = "$$expected" ]; then \
+	  echo "[host-parity] PASS: exp() at -1e30/-1e9/-1e6 (underflow), -745/-700 (finite, incl. the smallest subnormal), 710 (overflow), NaN -> $$out"; \
+	else \
+	  echo "[host-parity] FAIL: exp() range handling -> $$out"; \
+	  echo "[host-parity]       expected $$expected"; \
+	  exit 1; \
+	fi
+	@start_ns=$$(date +%s%N); \
+	out="$$(timeout 5 $(STANDALONE_BIN) --eval '(exp -1.0e6)')"; rc=$$?; \
+	end_ns=$$(date +%s%N); \
+	elapsed_ms=$$(( (end_ns - start_ns) / 1000000 )); \
+	if [ "$$rc" = "124" ]; then \
+	  echo "[host-parity] FAIL: (exp -1.0e6) did not answer within 5s (hang)"; exit 1; \
+	elif [ "$$out" != "0.0" ]; then \
+	  echo "[host-parity] FAIL: (exp -1.0e6) -> $$out (expected 0.0)"; exit 1; \
+	elif [ "$$elapsed_ms" -ge 1000 ]; then \
+	  echo "[host-parity] FAIL: (exp -1.0e6) took $${elapsed_ms}ms (expected well under 1000ms; this row alone used to run over 10s)"; exit 1; \
+	else \
+	  echo "[host-parity] PASS: (exp -1.0e6) answered 0.0 in $${elapsed_ms}ms (< 1000ms; was a >10s hang)"; \
+	fi
+	@echo "[standalone-reader-host-parity-smoke] PASS: all seven v1.2.0/v1.2.1 host-parity gaps"
 
 .PHONY: standalone-reader-getenv-smoke
 # The environment the parent set must reach `getenv' inside the standalone
