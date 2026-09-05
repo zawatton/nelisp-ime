@@ -1845,6 +1845,12 @@ Lisp object.  The allocation thread in option 5 is not refuted -- nobody
 has re-counted the allocations -- but it can no longer be reached from
 these timings.
 
+§6.15 did re-count them, and the last sentence is the wrong conclusion
+from the right observation: allocation does not separate the shapes
+because it is the SAME for all of them.  Every interpreted operation
+allocates ~30 objects whether or not it allocates a Lisp object, so §3's
+count was low but its instinct was sound.
+
 *** Where the time actually is
 
 The two outliers are `nth'/`nthcdr' and `substring', and the first one is
@@ -1871,6 +1877,11 @@ usable IME is therefore more about doing less per keystroke than about
 the floor -- which is what the four IME-side changes measured alongside
 this actually did, taking a keystroke from 742ms to 222ms cold and 76ms
 warm without touching the interpreter at all.
+
+That 76ms is a pass average, and §6.13 shows what it hides: one keystroke
+in about 127 runs a collection and blocks for 1.2 seconds and upward.
+The sentence above is right about the work per keystroke and wrong about
+what stands between this and a usable IME.
 
 The harness is `floor-cases.el' / `floor-bench.py' (separate processes)
 and `floor-inproc.el' (one process); neither is in the tree, both are a
@@ -2007,8 +2018,298 @@ speed up".  Three shapes, in increasing size:
 
 The IME numbers alongside this say the same thing from the other end.  A
 keystroke went from 742ms to 222ms cold and 76ms warm on changes that only
-removed repeated work -- no evaluator change at all.
+removed repeated work -- no evaluator change at all.  (Averages again; §6.13
+has the distribution, and the tail is somewhere else entirely.)
 
 The harness is `wrap-bench2.el', `sub-bench.el' and `fmt-diff.el'; none is in
 the tree, each is a page of elisp, and each should be re-run rather than
 trusted from here.
+
+** §6.13 The Windows standalone does not reclaim, and that is what a keystroke costs
+
+§6.11 and §6.12 both quote a keystroke through the IME at "76ms warm".  That
+number is a pass average -- seventeen keys typed, total divided by seventeen --
+and it hides the thing that actually makes the IME unusable.  Timed one key at
+a time, on the merged IME runtime for windows-x86_64:
+
+| keystrokes                      |  value |
+|---------------------------------+--------|
+| no collection: minimum          |   18ms |
+| no collection: median           |   79ms |
+| no collection: 95th percentile  |  197ms |
+| no collection: maximum          |  301ms |
+| WITH a collection               | 1202ms and up |
+
+765 keystrokes, six collections, one keystroke in 127.  A collection happens at
+one allocation, so it is paid by one keystroke rather than spread over the
+phrase, and the average never showed it.
+
+*** The pauses grow, and do not stop growing
+
+The six collections, in the order they happened:
+
+| collection | at keystroke | pause  | heap after |
+|------------+--------------+--------+------------|
+|          1 |           48 | 1202ms |    613 MiB |
+|          2 |          147 | 1373ms |    677 MiB |
+|          3 |          255 | 1634ms |    741 MiB |
+|          4 |          377 | 1816ms |    805 MiB |
+|          5 |          509 | 2041ms |    869 MiB |
+|          6 |          655 | 2367ms |    933 MiB |
+
+Exactly 64 MiB per collection, never less, and the pause tracks the heap.  Six
+minutes of typing one phrase reached 933 MiB and a 2.4-second freeze, still
+climbing.  Nothing here plateaus.
+
+*** Why: empty chunks are returned to the OS on linux-x86_64 and nowhere else
+
+The first reading was that the IME retains something per keystroke.  It does
+not: over ten passes every cache stayed exactly the size it started
+(candidates 64, surfaces 10, lattice memo 4, learning 0).  So the test moved
+off the IME entirely -- allocate nothing but garbage, and watch the heap.
+
+On =windows-x86_64=, four rounds of 200000 discarded conses each:
+
+: 200k garbage   heap 320 MiB   used 255 MiB   collections 5
+: 200k garbage   heap 384 MiB   used 324 MiB   collections 6
+: 200k garbage   heap 448 MiB   used 383 MiB   collections 7
+: (garbage-collect) twice   heap 448   used 383   collections 7
+: 200k garbage   heap 512 MiB   used 447 MiB   collections 8
+: 200k KEPT LIVE heap 576 MiB   used 511 MiB   collections 9
+
+`used' never goes down.  An explicit `garbage-collect' changes nothing at all
+-- not the used figure, not even the collection counter, so it is a no-op.  And
+keeping 200000 conses alive costs exactly what throwing 200000 conses away
+costs.
+
+That last line reads like a collector that cannot tell garbage from live data,
+and it is not.  `nelisp--arena-walk-verify' on the Windows build reports
+7925210 free objects against 245353 live: the mark phase is finding the live
+set and the sweep is finding the garbage.  `nl_alloc_diag' (switch 24, Doc 152
+Stage 4c) shows the free list being taken from, tens of millions of times a
+round, on both targets.  Marking, sweeping and free-list reuse all work here.
+
+One column differs, and it is the whole difference:
+
+| counter, over two rounds of 200k | windows-x86_64 | linux-x86_64 |
+|----------------------------------+----------------+--------------|
+| bucket (free-list) allocations   | 24.3M -> 52.4M | 22.6M -> 50.8M |
+| bump allocations                 |  5.5M ->  7.2M |  7.2M ->  8.9M |
+| chunks reclaimed                 |      0 ->    0 |      1 ->    2 |
+| bytes returned to the OS         |      0 ->    0 | 64 -> 128 MiB |
+| failed OS releases               |              0 |            0 |
+
+Windows returns nothing and does not fail trying: it never tries.  The reason
+is one line in the emitter.  Each target's chunk-allocator form defines
+
+: (defun nl_os_empty_chunk_reclaim_p () ...)
+
+and only the linux-x86_64 form returns 1 -- "ordinary mark/sweep may release
+proven-empty growth chunks on Linux x86_64", as its own comment says.
+windows-x86_64, macos and linux-aarch64 all return 0, with a stub
+`nl_os_reclaim_empty_chunk' beside it.  So on every target but one, the arena
+grows a chunk when the free list cannot satisfy a request and never gives one
+back, and the mark phase walks all of it forever after.
+
+This is unimplemented rather than broken, which is why no gate catches it: the
+predicate is doing exactly what it says.  What is missing is the record that
+its consequence on Windows is unbounded heap growth and an unbounded collection
+pause -- fatal for a process meant to live as long as a typing session, which
+is what an IME is.
+
+The same file, on =linux-x86_64=, built from a tree containing the same
+allocator commit (`ac378b8a', "split oversized free blocks on reuse instead of
+bumping"):
+
+: 200k garbage   heap 320 MiB   used 256 MiB   collections 2
+: 200k garbage   heap 320 MiB   used 256 MiB   collections 2
+: 200k garbage   heap 320 MiB   used 256 MiB   collections 2
+: 200k garbage   heap 320 MiB   used 256 MiB   collections 2
+: 200k KEPT LIVE heap 512 MiB   used 447 MiB   collections 5
+
+Flat through four rounds of garbage, and it grows only when the data is live.
+That is a working collector.  Both binaries were built from trees carrying the
+same allocator; the target is the only difference that was varied, and it
+changes the answer.
+
+The same non-reclamation is visible in v1.2.1's own Windows binary
+(`0d7418b0'), so this is not something the IME fork introduced and not
+something this week introduced.
+
+*** What it costs before a key is even pressed
+
+Loading the IME's six files on Windows takes the heap from 64 MiB to 549 MiB
+and runs eight collections, from 835 KB of dictionary source.  On the Linux
+build, where garbage is reclaimed, the same dictionary moves `used' from 93 MiB
+to 320 MiB -- an upper bound, since that figure still includes whatever the
+load allocated since the last collection.  The gap between 549 and something
+under 320 is unreclaimed parsing garbage that the process now carries and marks
+forever.
+
+*** For the ranked options
+
+This outranks everything in §6.11 and §6.12.  A basic operation is 1-31us and
+`format' is 849us; a collection is 2400000us and gets longer.  No amount of
+work on the wrapper layer reaches a 2.4-second freeze, and a process that grows
+64 MiB per collection cannot host a session-lifetime input method at all.
+
+It also changes what the earlier keystroke figures mean.  "742ms to 222ms cold
+and 76ms warm" in §6.11 and §6.12 is still what those changes did to the work
+per keystroke, and the median above (79ms) agrees with it.  But it was never
+the latency an IME is judged by, and quoting it alone read as though the
+remaining gap to a usable 50ms was a factor of one and a half.  It is not: the
+gap is the tail, and the tail is the collector.
+
+The measurement is `gc-reclaim.el' -- three rounds of garbage, two explicit
+collections, one round kept live, printing heap and used at each step -- with
+`ime-worst-key.el' and `ime-gc-growth.el' for the keystroke distribution.  None
+is in the tree; each is a page of elisp and takes under a minute on a build
+that already exists.
+
+** §6.14 Chunk reclamation on Windows: it works, and it does not fix the IME
+
+§6.13 found that `nl_os_empty_chunk_reclaim_p' returns 1 only in the
+linux-x86_64 chunk-allocator form, so windows-x86_64 never returned an empty
+chunk to the OS.  Turning it on is two lines, and the traversal behind it is
+already shared and already proves a chunk wholly free before releasing.  The
+one target-specific detail is the return convention: the caller uses munmap's
+-- zero is success -- and `VirtualFree' is a BOOL, nonzero for success, so the
+wrapper inverts.  Without that inversion a successful release reports failure
+and the caller relinks a descriptor whose mapping is gone.
+
+*** It works
+
+Ten rounds of 200000 discarded conses, heap in MiB after each:
+
+| round | before          | after                |
+|-------+-----------------+----------------------|
+|     1 |             320 |                  128 |
+|     3 |             512 |                  192 |
+|     6 |             704 |                  192 |
+|    10 |             896 |                  192 |
+
+Before, the heap rises every round and never stops.  After, it oscillates
+between 128 and 320 and stays there, and holding 200000 conses live still
+moves it -- so it is bounded rather than blind.  `nelisp--arena-walk-verify',
+`nelisp--arena-mark-reach-verify' and `nelisp--pool-root-coverage' are clean
+after the churn, and the Linux gate list is unaffected: the change is inside
+the windows-only form.
+
+*** It does not fix the IME
+
+The same runtime, typing the same phrase 45 times, still climbs 320 -> 832 MiB
+with the collection pause going 736ms to 2523ms.  Nine collections where there
+had been six, and the total time in collection over 765 keystrokes rose from
+10.4s to 13.6s: a smaller heap is reached sooner, and the collection trigger is
+heap-relative, so bounding the heap buys more frequent pauses.
+
+The reason chunk reclamation cannot help here is visible in the object counts.
+Sampled every second pass over twenty passes, the live count immediately after
+a collection is 551387, then 605364, then 569146 -- flat.  Nothing is retained
+per keystroke; §6.13's first reading of a leak was wrong.  What grows is the
+total, 4.7M objects to 11.6M, as the heap grows.
+
+So roughly 550000 live objects are spread across every chunk in the arena, and
+a chunk is only returned when *every* object in it is free.  With a live set
+that size and that scattered, almost no chunk qualifies, whatever the release
+path does.  This is fragmentation, and chunk-granularity reclamation is the
+wrong instrument for it.
+
+*** What that leaves
+
+The pause tracks the heap, not the live set -- 613 -> 933 MiB gave 1202 ->
+2367ms, and 320 -> 832 MiB gave 736 -> 2523ms, while the live set never moved.
+A mark phase costs the live set; a sweep costs the heap.  So the IME's pause is
+sweep, and the way to shorten it is to stop the heap growing, which needs one
+of:
+
+1. Allocate less per keystroke.  §6.12's wrapper layer is the supply: `format'
+   at 849us is not just slow, it is hundreds of allocations, and the IME's
+   STATE line goes through it.  This is the only one of the three that is
+   ordinary work rather than a runtime project.
+2. Keep the long-lived data out of the way of the short-lived.  The dictionary
+   is ~550000 objects that never die and currently sit interleaved with every
+   keystroke's garbage.  Segregating them is what makes whole chunks free.
+3. Compact.  The general answer, and the largest.
+
+The reclamation change is worth keeping on its own terms -- it removes a real
+asymmetry between targets and bounds a garbage-dominated heap -- but it should
+not be read as the IME fix, and §6.13 should not be read as saying the
+collector was broken.  It was not; it was missing one platform's release path,
+and that path was not what the IME needed.
+
+** §6.15 One interpreted operation allocates ~30 objects, whatever it does
+
+§6.11 measured the per-operation floor and found allocation did not separate
+the shapes: `(cons 1 2)' was cheaper than `(aref VECTOR 3)', so the section
+said §3's allocation reading "can no longer be reached from these timings".
+That was the right observation and the wrong conclusion.  Allocation does not
+separate the shapes because it is the same for all of them.
+
+`nl_alloc_diag' counts allocations by path, so they can be counted rather than
+inferred.  20000 turns of a `while' loop, each shape against the same loop with
+an empty body:
+
+| shape                | allocs/turn | over an empty turn |
+|----------------------+-------------+--------------------|
+| empty loop           |          77 |                 -- |
+| `(car CONS)'         |         106 |                 28 |
+| `(length STRING)'    |         105 |                 27 |
+| `(ash 256 -4)'       |         109 |                 31 |
+| `(cons 1 2)'         |         108 |                 31 |
+| `(list 1 2 3)'       |         110 |                 32 |
+| `(logand 255 15)'    |         111 |                 33 |
+| `(aref VECTOR 2)'    |         113 |                 36 |
+| `(+ 1 1)'            |         114 |                 36 |
+| `(aset STRING 2 ?a)' |         119 |                 41 |
+| zero-argument funcall|         141 |                 63 |
+
+An empty loop turn -- `<', `setq', `1+' and nothing else -- allocates 77
+objects.  Every operation adds 27 to 41 more.  `(cons 1 2)', which really does
+allocate one cons, adds 31; `(car CONS)', which allocates nothing at all, adds
+28.  The Lisp object the operation is *for* is under 4% of what running the
+operation costs.
+
+*** This is the mechanism under §6.11, §6.12 and §6.14
+
+It explains why the wrapper layer costs what §6.12 measured: a wrapper is
+several more interpreted operations, and each one is ~30 allocations and ~10us
+whether it computes anything or not.  `arrayp' as `(or (vectorp x) (stringp
+x))' is not slow because `or' is slow; it is slow because it is three
+operations where the emitter has one.
+
+It explains the shape of the IME's cost.  A keystroke through the production
+path allocates 253522 objects, which at ~30 per operation is roughly 8000
+interpreted operations -- and 8000 operations at §6.11's 1-31us is the ~80ms
+median §6.13 measured.  The two independent measurements agree, which is the
+main reason to believe either.
+
+And it explains the collection rate in §6.14.  Allocation volume is
+proportional to interpreted operations executed, not to what the program means
+to allocate, so a collection every ~100 keystrokes is a collection every ~25
+million allocations, which is what ~800000 interpreted operations produce.
+Nothing about the IME's data structures sets that rate; the amount of elisp run
+per keystroke sets it.
+
+*** What it leaves
+
+There is one lever, and §6.12 and §6.14 were both pointing at it from
+different ends: **run fewer interpreted operations per keystroke.**  Not
+allocate less -- the allocation is not the program's -- but execute less.
+
+That makes the ranked options concrete again:
+
+- Moving a wrapper into the emitter removes its operations outright.  `nthcdr'
+  went from an interpreted walk to one builtin: `(nth 5 LIST)' 399us -> 104us,
+  and the allocations went with the operations.
+- `format' is the largest single instance: ~750us per directive is ~75
+  operations and ~2000 allocations, every time a directive is rendered.
+- The IME's own hot spots follow the same rule.  `nelisp-ime-stateline--candidates'
+  costs 78563 allocations of the STATE line's 104161 -- not because it
+  allocates strings, but because hex-encoding thirty candidates is a few
+  thousand interpreted operations.  The encoder is already preallocated and
+  `aset'-based; there is nothing left to remove in it that is not an operation
+  count.
+
+The measurement is `alloc-per-op.el', a page of elisp, using switch 24/26 and
+subtracting an empty loop of the same shape.  It is not in the tree.
