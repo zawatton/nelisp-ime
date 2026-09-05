@@ -245,6 +245,7 @@
 # fixnum count to the `nl--nthcdr' reader builtin and keeps its own loop for
 # a bignum one, so its shape moved; lisp/nelisp-stdlib-list.el, which has no
 # builtin to call, is untouched.  Same divergence, new shape.
+
 # 945 -> 960 and 724 -> 726 on 2026-09-04, nelisp-ime fork.  This tree
 # carries the IME framework on top of the runtime, and its public API is
 # counted the same way the 848 above is: 13 names across
@@ -268,7 +269,14 @@
 # ns-prefix-violation and ns-private-escape counts further down, which
 # upstream did not touch -- so the two edits are independent and both
 # comment blocks are kept.
-ns-collision 252
+#
+# Merge of NeLisp main into the nelisp-ime fork, 2026-09-05 (second of the
+# day).  Both sides appended here again, and again to different counters:
+# upstream raised `ns-collision' 252 -> 255 with the cl-generic work, while
+# this fork's own additions are the ns-prefix-violation and ns-private-escape
+# counts further down, which upstream did not touch.  Upstream's count is
+# taken and both comment blocks are kept.
+ns-collision 255
 # 97 -> 96 on 2026-08-19: `string-equal' no longer differs between the two
 # files -- the prelude's now signals for a non-string instead of falling
 # through to `equal', and the lisp copy was brought with it.  Ratcheted down
@@ -1161,3 +1169,6 @@ pinned-collision ns-collision	nelisp-cl-macros--loop-iter-parse	lisp/nelisp-cl-m
 pinned-collision ns-collision	nelisp-cl-macros--loop-iter-plan	lisp/nelisp-cl-macros.el scripts/nelisp-stdlib-prelude.el
 pinned-collision ns-collision	nelisp-cl-macros--loop-unbuildable-p	lisp/nelisp-cl-macros.el scripts/nelisp-stdlib-prelude.el
 pinned-collision ns-collision	nelisp--split-on-char	lisp/nelisp-stdlib-regexp.el scripts/nelisp-stdlib-prelude.el
+pinned-collision ns-collision	nelisp-cl-generic--eql-matches	lisp/nelisp-cl-macros.el scripts/nelisp-stdlib-prelude.el
+pinned-collision ns-collision	nelisp-cl-generic--invoke-combined	lisp/nelisp-cl-macros.el scripts/nelisp-stdlib-prelude.el
+pinned-collision ns-collision	nelisp-cl-generic--head-matches	lisp/nelisp-cl-macros.el scripts/nelisp-stdlib-prelude.el

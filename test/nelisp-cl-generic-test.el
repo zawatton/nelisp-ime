@@ -381,9 +381,14 @@ not an ambiguity error."
 ;;; Loud-failure matrix (§3.5) beyond the against-the-bug qualifier case
 
 (nelisp-cl-generic-deftest nelisp-cl-generic/unsupported-specializer-form-signals ()
+  "`(head SYMBOL)' moved to §2.1's supported set (T59 addendum -- see
+the `nelisp-cl-generic/head-*' tests below); `(satisfies PRED)' (real
+CLOS/`cl-generic' has it, this subset never has) stays out of scope and
+still signals, exactly as `(head ...)' itself used to before T59."
   (cl-defgeneric cgt-usf (x))
-  (should-error (nelisp-cl-generic-test--eval (cl-defmethod cgt-usf ((x (head foo))) 'nope))
-                :type 'error))
+  (should-error
+   (nelisp-cl-generic-test--eval (cl-defmethod cgt-usf ((x (satisfies cgt-usf-pred))) 'nope))
+   :type 'error))
 
 (nelisp-cl-generic-deftest nelisp-cl-generic/specializer-on-position-gt-0-signals ()
   (cl-defstruct cgt-pgt0-dog name)
@@ -427,6 +432,295 @@ macroexpansion-time error rather than a silently-ignored default method."
   (cl-defstruct cgt-bare-thing id)
   (cl-defmethod cgt-bare-only ((x cgt-bare-thing)) 'bare-ok)
   (should (eq 'bare-ok (cgt-bare-only (make-cgt-bare-thing)))))
+
+;;; §2.2 extension -- `:extra STRING' qualifier.
+;;;
+;;; Every ordering claim below was cross-checked this session against
+;;; real, unmodified Emacs 31.1's own `cl-generic' (a throwaway batch
+;;; process, `(require 'cl-lib)'/`(require 'cl-generic)', no
+;;; `nelisp-cl-macros' loaded) -- these are parity forms, not just
+;;; internally-consistent assertions.  This is the exact shape of the
+;;; real-world bug this extension fixes: real Emacs's own
+;;; `lisp/emacs-lisp/cl-lib.el' (loaded transitively by
+;;; `(require 'cl-lib)', e.g. from `eat.el') has, at its own top level:
+;;;   (cl-defmethod cl-generic-generalizers :extra "derived-types" (type)
+;;;     ...)
+;;; an UNSPECIALIZED-arg `:extra' method on the same generic function
+;;; real Emacs's own `cl-generic.el' already gives a plain (non-`:extra')
+;;; unspecialized primary method -- exactly the shape of `CaseB'/`CaseB2'
+;;; below.
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/extra-methods-coexist-newest-first ()
+  "Parity form: real Emacs 31.1, same generic/methods, defined in the
+same order (primary, then `:extra' \"e1\", then `:extra' \"e2\"), gives
+call order `(e2 e1 primary)' -- most-recently-defined first, ending at
+the plain primary method (which is simply the chronologically oldest
+member of this group, not specially fixed-last: a separate real-Emacs
+probe this session, defining `:extra' \"e1\" FIRST, then the plain
+primary, then `:extra' \"e2\" LAST, gave `(e2 primary e1)' -- pure
+definition-recency order)."
+  (let (order)
+    (cl-defgeneric cgt-extra-basic (x))
+    (cl-defmethod cgt-extra-basic ((x integer))
+      (push 'primary order)
+      (if (cl-next-method-p) (cl-call-next-method) 'done))
+    (cl-defmethod cgt-extra-basic :extra "e1" ((x integer))
+      (push 'e1 order) (cl-call-next-method))
+    (cl-defmethod cgt-extra-basic :extra "e2" ((x integer))
+      (push 'e2 order) (cl-call-next-method))
+    (cgt-extra-basic 5)
+    (should (equal (reverse order) '(e2 e1 primary)))))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/extra-method-redefinition-keeps-position-not-front ()
+  "Real Emacs's own `cl-generic-define-method' comment: \"Keep the
+ordering; important for methods with :extra qualifiers.\" -- redefining
+\"e1\" (the OLDEST of the three) after \"e2\" already exists must NOT move
+it to the front; it stays between \"e2\" and the primary method.  Parity
+form: real Emacs 31.1 gives the identical `(e2 re-e1 primary)', not
+`(re-e1 e2 primary)'."
+  (let (order)
+    (cl-defgeneric cgt-extra-redef (x))
+    (cl-defmethod cgt-extra-redef ((x integer))
+      (push 'primary order) (if (cl-next-method-p) (cl-call-next-method) 'done))
+    (cl-defmethod cgt-extra-redef :extra "e1" ((x integer))
+      (push 'e1 order) (cl-call-next-method))
+    (cl-defmethod cgt-extra-redef :extra "e2" ((x integer))
+      (push 'e2 order) (cl-call-next-method))
+    (cl-defmethod cgt-extra-redef :extra "e1" ((x integer))
+      (push 're-e1 order) (cl-call-next-method))
+    (cgt-extra-redef 5)
+    (should (equal (reverse order) '(e2 re-e1 primary)))))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/extra-on-unspecialized-arg-not-ambiguous ()
+  "The real bug this extension fixes: an UNSPECIALIZED `:extra' method
+alongside an unspecialized primary (real Emacs's own `cl-lib.el' does
+exactly this to `cl-generic-generalizers').  Before this extension, two
+unspecialized methods were the SAME `nelisp-cl-generic--same-specializer-p'
+identity and one replaced the other; now they coexist, newest first, with
+NO ambiguous-dispatch error (unspecialized has no such check regardless,
+but this confirms both actually run, in order, via a counter)."
+  (let ((ran 0))
+    (cl-defgeneric cgt-extra-unspec (x))
+    (cl-defmethod cgt-extra-unspec (specializer) 'base-generalizer)
+    (cl-defmethod cgt-extra-unspec :extra "derived-types" (type)
+      (setq ran (1+ ran))
+      (if (cl-next-method-p) (cl-call-next-method) 'no-next))
+    (should (eq 'base-generalizer (cgt-extra-unspec 'anything)))
+    (should (= ran 1))))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/extra-same-type-name-not-ambiguous ()
+  "Two `:extra' variants of the SAME builtin type-name must NOT trip the
+`ambiguous dispatch' check (§3.5) that guards genuinely DIFFERENT
+type-names tying -- `nelisp-cl-generic/ambiguous-builtin-type-dispatch-
+signals' above still covers that real ambiguity, unchanged."
+  (let (order)
+    (cl-defgeneric cgt-extra-same-type (x))
+    (cl-defmethod cgt-extra-same-type ((x integer))
+      (push 'primary order) 'done)
+    (cl-defmethod cgt-extra-same-type :extra "e1" ((x integer))
+      (push 'e1 order) (cl-call-next-method))
+    (cgt-extra-same-type 5)
+    (should (equal (reverse order) '(e1 primary)))))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/extra-requires-a-string-signals ()
+  (cl-defgeneric cgt-extra-nostr (x))
+  (should-error
+   (nelisp-cl-generic-test--eval (cl-defmethod cgt-extra-nostr :extra (x) 'nope))
+   :type 'error))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/extra-combined-with-before-after-around ()
+  "Parity form: real Emacs 31.1, the identical generic/methods, gives
+call order `(around-enter before primary after around-leave)' and a
+final result of `primary-result' -- before/after run for effect only and
+never change the primary chain's own return value; `:around' wraps the
+whole combination and can inspect/alter what `cl-call-next-method'
+returns.  `:extra' must be the FIRST qualifier when combined with a
+combinator -- real Emacs's own `cl--generic-standard-method-combination'
+only strips a LEADING `:extra STRING' pair, confirmed this session:
+`(cl-defmethod bar :around :extra \"x\" (...) ...)' (combinator first)
+signals \"Unsupported qualifiers\" in real, unmodified Emacs 31.1 too."
+  (let (order)
+    (cl-defgeneric cgt-extra-combo (x))
+    (cl-defmethod cgt-extra-combo ((x integer))
+      (push 'primary order) 'primary-result)
+    (cl-defmethod cgt-extra-combo :extra "be1" :before ((x integer))
+      (push 'before order))
+    (cl-defmethod cgt-extra-combo :extra "ae1" :after ((x integer))
+      (push 'after order))
+    (cl-defmethod cgt-extra-combo :extra "ar1" :around ((x integer))
+      (push 'around-enter order)
+      (prog1 (cl-call-next-method)
+        (push 'around-leave order)))
+    (should (eq 'primary-result (cgt-extra-combo 7)))
+    (should (equal (reverse order)
+                   '(around-enter before primary after around-leave)))))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/extra-combinator-wrong-order-signals ()
+  "`:around :extra STRING' (combinator before `:extra') is not the same
+qualifier list as `:extra STRING :around' -- real Emacs itself rejects
+the former (measured this session) with \"Unsupported qualifiers\"; this
+subset rejects it too, at `cl-defmethod' macroexpansion time, same as
+every other unsupported qualifier shape (§3.5)."
+  (cl-defgeneric cgt-extra-wrong-order (x))
+  (should-error
+   (nelisp-cl-generic-test--eval
+    (cl-defmethod cgt-extra-wrong-order :around :extra "x" (x) 'nope))
+   :type 'error))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/no-primary-method-signals ()
+  "A call whose only applicable methods are `:extra'+combinator (no
+plain, no-combinator method at all, `:extra' or otherwise) signals
+`cl-no-primary-method' -- real Emacs's own condition name/message, not
+reachable in this subset before the `:extra' extension (previously any
+qualifier other than none was rejected at `cl-defmethod' time, so \"some
+methods applicable, none of them primary\" could never arise)."
+  (cl-defgeneric cgt-no-primary (x))
+  (cl-defmethod cgt-no-primary :extra "b" :before ((x integer))
+    (ignore x))
+  (should-error (cgt-no-primary 5) :type 'cl-no-primary-method))
+
+;;; T59 addendum -- `(head SYMBOL)' specializer.
+;;;
+;;; The real bug this closes: `eat.el' itself uses `(cl-defmethod ...
+;;; ((x (head SYMBOL))) ...)' forms, which used to hit
+;;; `nelisp-cl-generic/unsupported-specializer-form-signals' above (moved
+;;; to `(satisfies ...)' now that `head' is supported).  Every ordering
+;;; claim below was cross-checked this session against real, unmodified
+;;; Emacs 31.1's own `cl-generic' (a throwaway batch process,
+;;; `(require 'cl-lib)', no `nelisp-cl-macros' loaded) -- parity forms,
+;;; not just internally-consistent assertions.  Real Emacs's own
+;;; generalizer priorities (`cl-generic.el'): `eql' 100, `head' 80, any
+;;; `cl-typep' type match 10, the unspecialized catch-all 0 -- so `head'
+;;; is strictly between `eql' and every type match, confirmed directly
+;;; below rather than assumed.
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/head-matches-cons-with-eq-car ()
+  "Parity form: real Emacs 31.1 dispatches `(head foo)' on any cons whose
+`car' is `eq' to `foo', and never on a non-cons or a cons headed by a
+different symbol."
+  (cl-defgeneric cgt-head-basic (x))
+  (cl-defmethod cgt-head-basic (x) 'fallback)
+  (cl-defmethod cgt-head-basic ((x (head foo))) 'head-foo)
+  (should (eq 'head-foo (cgt-head-basic '(foo 1 2))))
+  (should (eq 'head-foo (cgt-head-basic '(foo))))
+  (should (eq 'fallback (cgt-head-basic '(bar 1))))
+  (should (eq 'fallback (cgt-head-basic nil)))
+  (should (eq 'fallback (cgt-head-basic 'foo))))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/head-different-symbols-never-ambiguous ()
+  "Two DIFFERENT `head' specializers can never both match one `car' (only
+one symbol can be `eq' to it), unlike two different builtin type-names
+\(§2.1a's already-documented ambiguous case) -- so this never trips the
+ambiguous-dispatch check."
+  (cl-defgeneric cgt-head-two (x))
+  (cl-defmethod cgt-head-two (x) 'fallback)
+  (cl-defmethod cgt-head-two ((x (head foo))) 'head-foo)
+  (cl-defmethod cgt-head-two ((x (head bar))) 'head-bar)
+  (should (eq 'head-foo (cgt-head-two '(foo))))
+  (should (eq 'head-bar (cgt-head-two '(bar))))
+  (should (eq 'fallback (cgt-head-two '(baz)))))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/head-outranks-builtin-type-match ()
+  "Parity form: real Emacs 31.1, the same generic/methods (`cons' type
+specializer plus `(head foo)'), calls `(head foo)' first for `(foo 1)',
+continuing to the `cons' method via `cl-call-next-method' -- generalizer
+priority 80 beats 10."
+  (let (order)
+    (cl-defgeneric cgt-head-vs-cons (x))
+    (cl-defmethod cgt-head-vs-cons (x) (push 'fallback order) 'done)
+    (cl-defmethod cgt-head-vs-cons ((x cons))
+      (push 'cons-type order) (cl-call-next-method))
+    (cl-defmethod cgt-head-vs-cons ((x (head foo)))
+      (push 'head-foo order) (cl-call-next-method))
+    (cgt-head-vs-cons '(foo 1))
+    (should (equal (reverse order) '(head-foo cons-type fallback)))))
+
+(defvar cgt-head-vs-eql--shared (list 'foo 1)
+  "A global, not `let'-bound: real Emacs's own `eql' specializer method
+evaluates its VALUE form via `(eval form t)' OUTSIDE the `cl-defmethod'
+call's own lexical scope (confirmed this session -- a `let'-bound
+variable of the same name is `void-variable' there), so a form capturing
+a value across calls must be a global for this to be a genuine parity
+form against real Emacs, not merely internally consistent.")
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/eql-outranks-head ()
+  "Parity form: real Emacs 31.1, an `eql' specializer whose value is `eq'
+to the very cons passed at call time outranks a `(head foo)' specializer
+that ALSO matches it (same cons, `car' `foo') -- generalizer priority 100
+beats 80; a call with a DIFFERENT `(foo ...)' cons (not `eql' to the
+baked-in value) only reaches the `head' method."
+  (let (order)
+    (cl-defgeneric cgt-head-vs-eql (x))
+    (cl-defmethod cgt-head-vs-eql (x) (push 'fallback order) 'done)
+    (cl-defmethod cgt-head-vs-eql ((x (head foo)))
+      (push 'head-foo order) (cl-call-next-method))
+    (cl-defmethod cgt-head-vs-eql ((x (eql (identity cgt-head-vs-eql--shared))))
+      (push 'eql-shared order) (cl-call-next-method))
+    (cgt-head-vs-eql cgt-head-vs-eql--shared)
+    (should (equal (reverse order) '(eql-shared head-foo fallback)))
+    (setq order nil)
+    (cgt-head-vs-eql (list 'foo 1))
+    (should (equal (reverse order) '(head-foo fallback)))))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/head-value-not-evaluated ()
+  "The VALUE in `(head VALUE)' is taken literally, never evaluated --
+matching real Emacs's own `(cadr specializer)' (no `eval' call anywhere
+in `cl--generic-head-generalizer'/its `cl-generic-generalizers' method).
+A lexically-bound variable named the same as the head symbol must not
+leak in: this method only fires for a cons headed by the SYMBOL `quux',
+never for one headed by whatever `quux' happens to be bound to."
+  (let ((quux 'something-else))
+    (cl-defgeneric cgt-head-literal (x))
+    (cl-defmethod cgt-head-literal (x) 'fallback)
+    (cl-defmethod cgt-head-literal ((x (head quux))) 'head-quux)
+    (should (eq 'head-quux (cgt-head-literal '(quux 1))))
+    (should (eq 'fallback (cgt-head-literal '(something-else 1))))))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/head-extra-methods-coexist-newest-first ()
+  "Same `:extra' coexistence/chaining machinery as the eql/type tiers
+above, now exercised on a `head' specializer -- parity form, real Emacs
+31.1 gives the identical `(e2 e1 primary)'."
+  (let (order)
+    (cl-defgeneric cgt-head-extra (x))
+    (cl-defmethod cgt-head-extra ((x (head foo)))
+      (push 'primary order) (if (cl-next-method-p) (cl-call-next-method) 'done))
+    (cl-defmethod cgt-head-extra :extra "e1" ((x (head foo)))
+      (push 'e1 order) (cl-call-next-method))
+    (cl-defmethod cgt-head-extra :extra "e2" ((x (head foo)))
+      (push 'e2 order) (cl-call-next-method))
+    (cgt-head-extra '(foo))
+    (should (equal (reverse order) '(e2 e1 primary)))))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/head-extra-redefinition-keeps-position ()
+  "Parity form: redefining \"e1\" after \"e2\" already exists keeps its
+list position (`(e2 re-e1 primary)'), matching the eql/type tiers'
+already-tested behaviour and real Emacs 31.1's own."
+  (let (order)
+    (cl-defgeneric cgt-head-extra-redef (x))
+    (cl-defmethod cgt-head-extra-redef ((x (head foo)))
+      (push 'primary order) (if (cl-next-method-p) (cl-call-next-method) 'done))
+    (cl-defmethod cgt-head-extra-redef :extra "e1" ((x (head foo)))
+      (push 'e1 order) (cl-call-next-method))
+    (cl-defmethod cgt-head-extra-redef :extra "e2" ((x (head foo)))
+      (push 'e2 order) (cl-call-next-method))
+    (cl-defmethod cgt-head-extra-redef :extra "e1" ((x (head foo)))
+      (push 're-e1 order) (cl-call-next-method))
+    (cgt-head-extra-redef '(foo))
+    (should (equal (reverse order) '(e2 re-e1 primary)))))
+
+(nelisp-cl-generic-deftest nelisp-cl-generic/head-malformed-form-still-signals ()
+  "`(head foo bar)' (more than one VALUE) is a DELIBERATE divergence, not
+an oversight: measured this session, real Emacs 31.1 macroexpands it
+without error and silently ignores the trailing `bar' (its own
+generalizer method only ever reads `(cadr specializer)').  Doc 185's
+whole loud-failure discipline (§2.2/§3.5) exists precisely to prefer a
+macroexpansion-time `error' over a silently-ignored extra token, so this
+subset is intentionally stricter here."
+  (cl-defgeneric cgt-head-malformed (x))
+  (should-error
+   (nelisp-cl-generic-test--eval
+    (cl-defmethod cgt-head-malformed ((x (head foo bar))) 'nope))
+   :type 'error))
 
 (provide 'nelisp-cl-generic-test)
 ;;; nelisp-cl-generic-test.el ends here
