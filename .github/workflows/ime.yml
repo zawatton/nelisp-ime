@@ -12,6 +12,15 @@ on:
       - 'packages/nelisp-ime-lattice'
       - 'packages/nelisp-json/**'
       - 'platform/**'
+      # The smokes build the runtime and run the IME on it, so a change to
+      # what the runtime IS matters here as much as a change to the IME.
+      # Merging NeLisp main on 2026-09-05 rewrote `substring' and `nthcdr'
+      # in the reader the smokes exercise, and ran no job in this workflow:
+      # the paths below name the IME, and an upstream merge touches none of
+      # them.  Same shape as the submodule line above.
+      - 'scripts/**'
+      - 'lisp/**'
+      - 'src/**'
       - '.github/workflows/ime.yml'
   pull_request:
     paths:
@@ -23,6 +32,15 @@ on:
       - 'packages/nelisp-ime-lattice'
       - 'packages/nelisp-json/**'
       - 'platform/**'
+      # The smokes build the runtime and run the IME on it, so a change to
+      # what the runtime IS matters here as much as a change to the IME.
+      # Merging NeLisp main on 2026-09-05 rewrote `substring' and `nthcdr'
+      # in the reader the smokes exercise, and ran no job in this workflow:
+      # the paths below name the IME, and an upstream merge touches none of
+      # them.  Same shape as the submodule line above.
+      - 'scripts/**'
+      - 'lisp/**'
+      - 'src/**'
       - '.github/workflows/ime.yml'
 
 jobs:
