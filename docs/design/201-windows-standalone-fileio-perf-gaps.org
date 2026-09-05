@@ -246,6 +246,10 @@ under `dev/nelisp/`, safe to delete or keep as future repro material):
   but `getenv "PATH"` and `make-string` both come back
   `multibyte-string-p` nil, and the flat-regardless-of-position timing
   confirms they are not taking that arm).
+- **Superseded by §6.11**, which re-measured this on 5931f980 with two
+  instruments and got 1-31us, not 0.15-0.36ms, and a 20-30x spread rather
+  than a flat cost.  The paragraph below is left as written because four
+  later sections quote it.
 - Every basic primitive measured costs about the same, ~0.15-0.36ms per
   call, regardless of which one: `(+ 1 1)`, `(aref VECTOR 0)`, `(aref
   STRING 0)`, `(car CONS)`, a zero-arg user-defined function call, `(setq
@@ -1185,9 +1189,14 @@ fire.  Small, and the only item in the rule-tree cost that is ours.
 
 **5. Interpreter per-operation cost (THIS repository).  Open-ended.**
 
-§3's 262us is what everything above is a multiple of.  It is the only
-lever that helps every workload rather than one file, and the only one
-with no owner but us.  §6.5's unexplained ~5% and §6.8's allocation-shaped
+§3's 262us is what everything above is a multiple of -- though §6.11 puts
+a basic operation at 1-31us, so the multiplier is smaller than written
+here, and §6.12 finds that for the functions ordinary elisp calls the
+evaluator's per-operation cost is not what is being paid at all: the
+prelude's correction layer is 10-170x the builtins it wraps.  The option
+keeps its rank; what it means changes, and §6.12 names the three shapes
+the work takes.  It is still the only lever that helps every workload
+rather than one file, and the only one with no owner but us.  §6.5's unexplained ~5% and §6.8's allocation-shaped
 kernel time are the two concrete threads into it.
 
 **6. Native AOT on windows-x86_64.  Unknown payoff -- measure first.**
@@ -1474,7 +1483,9 @@ Measured, and it is not:
   per trivial operation predicts.
 - That same loop took 78.66s, i.e. **262µs per `(+ 1 1)`** -- §3's
   0.15-0.4ms per basic operation, reproduced independently on today's
-  binary.
+  binary.  §6.11 re-measured the same form on 5931f980 and got 7-17us;
+  neither this number nor the allocation reading in the bullet above
+  reproduces there.
 
 So Defender is not why this is slow; the interpreter is.  Defender and the
 search indexer do explain the VARIANCE, which is why the floor control
@@ -1655,3 +1666,349 @@ them: the E2E budget gap (§6.8 -- the harness passes 5/5, entry
 4.75-5.89s against 10s); the `bin=./target/nelisp; [ -f ...] ||` idiom
 (all 15 remaining sites now use `STANDALONE_BIN`, zero left); and the six
 gate-side defects §6.7 inventoried.
+
+** §6.10 Option 6 answered: native AOT does not pay off, measured on Linux
+
+§6.8's ranked list left option 6 -- native AOT on windows-x86_64 -- open,
+with an explicit way to close it: "run the same source-vs-nelc-vs-neln
+comparison on linux-x86_64, where native emission IS available.  If `neln'
+is a large win there, the PE work is justified [...] if the workload is
+dominated by runtime primitives that stay interpreted either way, it is
+not.  That experiment is one afternoon and it decides a subsystem-sized
+investment."
+
+It has been run.  The answer is *not justified*, and the number that says
+so is not the one the doc expected.
+
+*** What was measured
+
+linux-x86_64, `origin/main' at the time (5b8f0b0e), three workloads whose
+hot code lives in `defun's, each loaded three ways: the source, a `.nelc'
+(bytecode) artifact, and a `.neln' compiled with `--native-policy
+required' so the native section is really there.  Wall time, best of two,
+`load-elisp-source' for the artifacts.
+
+| workload                           | source | neln (native) | native fns |
+|------------------------------------+--------+---------------+------------|
+| split / format over 214 entries    | 20.49s |        23.70s |          4 |
+| hash + substring + cost sort       | 13.55s |        11.88s |          6 |
+| literal table + linear lookup      |  3.49s |       145.85s |          4 |
+
+Best case 12% faster.  Worst case 42x SLOWER.  Nothing here is the "large
+win" that would justify the PE emitter, and the shape closest to what the
+IME actually does -- the middle row -- is the one that gained 12%.  The
+reading §6.8 offered as the alternative outcome is the one that happened:
+these workloads are dominated by runtime primitives that stay interpreted
+whichever way the file is loaded.
+
+The `.nelc' column is left out of the table because it says nothing new:
+it tracked the source within a few percent on the first two workloads and
+timed out past 150s on the third, which is §6.8's own Windows finding
+reproducing on Linux.
+
+*** A wrong turn worth recording, because the next person will take it
+
+The first run of this experiment reported `:native-report nil' and
+`:module-policy bytecode' on every `neln', on Linux, and was read as
+"native emission is unavailable here too, so §6.8's premise is wrong".
+That conclusion was wrong and the measurement was mine to blame: all
+three workloads put their work in TOP-LEVEL forms.  The native path
+compiles `defun's, `nelisp-artifact--native-compile-required-section'
+answers `(if (null defuns) ... nil)', and a file with no defuns therefore
+has nothing to compile.  Native emission on linux-x86_64 works; the
+workloads had to be rewritten around functions before the experiment
+measured anything at all.
+
+Related, and not a defect: `--native-policy required' succeeds on a file
+with no defuns.  Every top-level defun did enter the native section,
+vacuously.  `tools/nelisp-native-artifact-gate.sh' asserts real coverage
+on a fixture that has defuns and has a negative case that must fail, so
+the gate is not making a false claim -- but a `required' compile that
+proves nothing still exits 0, and that is what made the wrong turn easy.
+
+*** Three defects the experiment surfaced, all fixed
+
+1. *A `.nelc' or `.neln' artifact of any file whose defun body used
+   `dotimes' or `dolist' could not be loaded*, failing with
+   `void-function' naming the loop variable, on both linux-x86_64 and
+   windows-x86_64.  `nelisp-artifact--try-compile-defun' handed the body
+   straight to `nelisp-bc-compile' without the `macroexpand-all' the
+   `.elc' lane has always done, and `nelisp-bc--compile-form' then took
+   the unexpanded macro through its generic call arm, where the BINDING
+   SPEC `(i 3)' became a call to `i'.  It compiled cleanly and failed only
+   when the bytecode ran, so the caller's fall-back-to-replay never fired.
+   Both gate fixtures use loop-free bodies, which is why nothing caught
+   it.  Fixed in `96689e36'.
+
+2. *The opportunistic native path compiled nothing on Linux* while
+   `required' compiled everything, reporting `void-variable a' per defun.
+   The root cause is not in the artifact or AOT code at all: the
+   standalone's own `cl-loop' subset expanded an unrecognised clause shape
+   to nil, and `nelisp-aot-compiler--emit-extern-call' is written with
+   parallel `for a in args for target in arg-targets ... unless ...
+   collect'.  The parser kept one iterator, the whole form became nil, and
+   the probe failed on a loop that had never been built.
+
+3. *48 of this repository's 62 `cl-loop' forms were in that state*, 33 of
+   them in the AOT compiler, the rest across the GC verifier, the cc
+   backends, textprop-display, sys, jit, http and the standalone builder.
+   They emitted nothing on the standalone and every host test stayed green,
+   because the host has the real macro.  One of them,
+   `emit-extern-call''s `for idx downfrom (1- n) to reg-budget do ... push',
+   is the loop that places arguments which do not fit in registers.  The
+   subset now models parallel iterators, `on', `across', the numeric
+   directions, `= then', `unless', `append' and `always', the tree is at
+   zero unbuildable forms, and an unsupported shape signals when it runs
+   instead of expanding to nil.  `75880ab0' and `108012a7'.
+
+*** What this closes and what it leaves
+
+Option 6 is closed: PE native emission is not justified by performance,
+and should be revisited only if something other than speed needs it.
+`ffi-smoke' remains its own reason to want that machinery, and is
+unaffected by this measurement.
+
+Option 5 -- the interpreter's own per-operation cost, §6.8's 262us -- is
+untouched by all of this and remains the only lever that helps every
+workload.  §6.11 re-measures that floor and finds it much lower than
+262us, which changes the option's size but not its rank.  The IME numbers make the scale concrete: one keystroke through
+the JSON-RPC boundary costs 312ms with a compact snapshot and 742ms
+without, against the 50ms a usable IME needs.  The two primitive
+regressions fixed alongside this work (`string-to-number' 5.8x,
+`make-hash-table' 2.2x) did not move that number measurably, and neither
+would native AOT at 12%.
+
+** §6.11 The per-operation floor, measured again: §3's number does not reproduce
+
+§3 records that "every basic primitive measured costs about the same,
+~0.15-0.36ms per call, regardless of which one", and §6.8's 262us for
+`(+ 1 1)' is quoted from it in four later places -- as the multiplier
+under every ranked option, and as the reason option 5 is the only lever
+that helps every workload.  Both halves of that sentence were re-measured
+on 5931f980 and neither holds.
+
+*** The numbers
+
+Two instruments, because this document already records (§6.8, "On
+measurement variance") that this host moves timings 2-3x between runs and
+that an average over a contaminated sample is still contaminated.
+
+The first runs each shape in its own process, 20000 iterations of a
+`while' loop, median of three, and subtracts an empty loop measured the
+same way.  The second runs every shape in ONE process, round-robin over
+three rounds, keeping each shape's best -- so a drift inside the session
+spreads over all of them and the shapes stay comparable to each other,
+which is the comparison §3 actually makes.
+
+| shape                  | separate processes | one process |
+|------------------------+--------------------+-------------|
+| empty loop (per turn)  |               61us |        22us |
+| `(+ 1 1)'              |                7us |        17us |
+| `(+ i 1)'              |               12us |        13us |
+| `(car CONS)'           |               13us |         1us |
+| `(aref VECTOR 3)'      |               18us |        16us |
+| `(aref STRING 3)'      |               19us |        14us |
+| `(cons 1 2)'           |               25us |         7us |
+| `(concat "ab" "cd")'   |               25us |        11us |
+| `(gethash 'k TABLE)'   |               28us |        64us |
+| `(list 1 2 3)'         |               30us |         8us |
+| `(make-vector 4 0)'    |               31us |        12us |
+| `(let ((x 1)) x)'      |               57us |        15us |
+| zero-argument funcall  |               69us |        12us |
+| `(substring STR 2 5)'  |              223us |       128us |
+| `(nthcdr 5 LIST)'      |                  - |       330us |
+| `(nth 5 LIST)'         |              521us |       399us |
+
+*** What that changes
+
+**A basic operation is not 262us.**  It is 1-31us, whichever instrument
+is used, and `(+ 1 1)' -- the exact form §6.8 quotes -- is 7-17us.  The
+gap is 15-40x.  This document should not be read as saying an interpreter
+call costs a quarter of a millisecond, and the four places quoting that
+number are quoting a measurement that no longer reproduces.  Whether the
+runtime got faster between 2026-08-30 and 5931f980 or the two
+measurements were never the same measurement is not settled here, and
+saying which would need the old harness, which is not in the tree.  What
+is settled is that the number should be re-measured before it is used.
+
+**They are not all the same, either.**  §3's "regardless of which one"
+was true of the six shapes it tried; over sixteen the spread is 20-30x,
+and it is not noise -- the ordering is identical under both instruments.
+
+**Allocation is not what separates them.**  §3 reads the ~14 heap
+allocations it counted per `(+ 1 1)' as the thing driving the flat
+per-call cost.  Whatever those allocations are, they do not show up as a
+difference between shapes that allocate and shapes that do not: `(cons
+1 2)' at 7us and `(list 1 2 3)' at 8us are CHEAPER than `(aref VECTOR 3)'
+at 16us and `(gethash 'k TABLE)' at 64us, neither of which allocates a
+Lisp object.  The allocation thread in option 5 is not refuted -- nobody
+has re-counted the allocations -- but it can no longer be reached from
+these timings.
+
+*** Where the time actually is
+
+The two outliers are `nth'/`nthcdr' and `substring', and the first one is
+explained: `nthcdr' was walked by the prelude, one interpreted iteration
+per element, while `car', `cdr', `length' and `elt' all have reader
+builtins.  A builtin walk takes `(nthcdr 5 LIST)' from 330us to 68us and
+`(nth 5 LIST)' from 399us to 104us, and the builtin alone is 19us -- the
+rest is the prelude wrapper that keeps a bignum count on the old path.
+
+`substring' at 128-223us is the one left.  It is not obviously wrong the
+way `nthcdr' was -- it allocates and it decodes UTF-8 -- but it is five
+to ten times a basic operation and the lattice conversion probes it once
+per candidate edge, so it is where the next look should go.  §6.12 took
+that look: neither allocation nor UTF-8 turned out to be the cost.
+
+*** For the ranked options
+
+Option 5 keeps its place as the only lever that helps every workload, but
+its size changes.  A keystroke through the IME on this runtime is
+roughly 76ms warm, which at 1-31us an operation is thousands of
+operations, not hundreds: the work is real and the interpreter is not
+fifteen times slower than it looked.  Closing the remaining gap to a
+usable IME is therefore more about doing less per keystroke than about
+the floor -- which is what the four IME-side changes measured alongside
+this actually did, taking a keystroke from 742ms to 222ms cold and 76ms
+warm without touching the interpreter at all.
+
+The harness is `floor-cases.el' / `floor-bench.py' (separate processes)
+and `floor-inproc.el' (one process); neither is in the tree, both are a
+page of elisp, and either should be re-run rather than trusted from here.
+
+** §6.12 Where the time actually is: the prelude's wrapper layer, not the interpreter
+
+§6.11 corrected §3's per-operation floor from 262us to 1-31us and left two
+outliers, `nth'/`nthcdr' and `substring'.  `nthcdr' turned out to be the
+prelude walking a list one interpreted iteration at a time where a reader
+builtin could walk it (`3933b5b8').  Chasing `substring' the same way found
+something larger, and not specific to `substring'.
+
+*** The measurement
+
+The prelude corrects native builtins that are wrong in specific ways.  The
+idiom is fixed: capture the builtin as `nelisp--native-X', then install an
+elisp `X' over it.  Eleven functions are wrapped that way, so each was timed
+against the builtin it delegates to, all in one process, round-robin, best of
+three rounds, empty loop subtracted -- the instrument §6.11 describes.
+
+These numbers were taken on `28817257', §6.11's on `5931f980', so `substring'
+reads 82us here and 128-223us there.  Both are this host on the days they were
+run; the two are not meant to be subtracted from each other, and the ratio
+inside one table -- wrapper against the builtin it calls, measured in the same
+process seconds apart -- is what carries the argument.
+
+| function              | wrapper | the builtin under it |
+|-----------------------+---------+----------------------|
+| `format' with a width | 1330us  | --                   |
+| `format' "%s"         |  849us  |                  5us |
+| `substring'           |   82us  |                  3us |
+| `functionp'           |   63us  |                 42us |
+| `truncate'            |   48us  |                  3us |
+| `ceiling'             |   47us  |                  3us |
+| `floor'               |   43us  |                  3us |
+| `equal'               |   38us  |                 <1us |
+| `intern'              |   25us  |                  5us |
+| `car' (not wrapped)   |    4us  |                   -- |
+| `concat' (not wrapped)|    7us  |                   -- |
+
+An unwrapped builtin costs 3-7us.  A wrapped one costs 25-1330us.  The
+wrapper is 10-170x the work it guards, and for the whole set the layer, not
+the evaluator underneath it, is what the call costs.
+
+`prin1', `princ' and `terpri' are absent because they cannot be measured this
+way.  A first attempt gave them a sink function; the runtime printed to stdout
+regardless, 120000 characters of it, and the I/O moved every other shape in
+the same process -- native `substring' came back below the empty loop.  A
+benchmark that prints cannot measure itself, and the numbers from that run
+were discarded rather than corrected.
+
+*** Why the wrappers cost this much
+
+`format' is the clearest, and it is the shape of the rest.  It parses the
+template character by character in elisp on every call, and it builds its
+result with
+
+: (setq out (concat out (char-to-string ch)) i (1+ i))
+
+-- one allocation of the entire accumulated output per literal character.
+Per directive it rebuilds a one-directive mini-template with `concat' and
+`char-to-string', hands that to the builtin, then applies the width and
+precision layer with more `concat' and several `substring' calls.
+
+Which of those dominates is worth knowing before anyone works on it, so the
+template was varied one part at a time:
+
+| template            | us/op | what it adds                     |
+|---------------------+-------+----------------------------------|
+| `""'                |    72 | the fixed cost of entering at all |
+| `"abc"'             |   205 | 3 literal characters             |
+| 12 literals         |   764 | ~64us per literal character      |
+| 24 literals         |  1533 | still linear at this size        |
+| `"%s"' of an int    |   817 | one directive                    |
+| `"%d"'              |   906 |                                  |
+| `"%S"'              |  1192 | `prin1-to-string' rather than the builtin |
+| `"%s%s"'            |  1609 | ~760us for the second directive  |
+| `"%s%s%s%s"'        |  3071 | linear in directives             |
+| the builtin, any of these | 6 |                                |
+
+So a directive costs about 750us and a literal character about 64us, on a
+72us base, against 6us for the builtin doing the whole template.  The
+per-character append is real but it is the smaller half: for the templates
+elisp actually writes, the directive path is where the time is, and a
+`(format "%s" 1)' with no literal characters at all still costs 817us.
+
+Neither number is an allocation count.  `concat' is 7us, `char-to-string'
+5us and `aref' 5us here, so the ~64us of a literal character is mostly the
+interpreted `while', `if', `let' and two `setq's around them -- the same
+reading §6.11 reached from the other direction.
+
+Which is the second effect: **the wrappers call each other.**  `format' calls
+`substring' at 82us a time, and `substring' is itself a wrapper whose own
+guard, `arrayp', is elisp -- `(or (vectorp x) (stringp x))', 26us, where
+`stringp' alone is 7us and the emitter already carries `bf_arrayp_raw' with
+exactly the right tag test but no dispatch arm to reach it.  A single
+`(format "%-6s|" 1)' therefore pays the interpreter for a template scan, a
+mini-template rebuild, a padding pass, several wrapped `substring' calls, and
+inside each of those an `arrayp' that is two more interpreted calls.
+
+*** What this changes
+
+Option 5 is "interpreter per-operation cost", and everything ranked under it
+is a multiple of §3's 262us.  §6.11 already showed that number does not
+reproduce.  This says more than that the multiplier is wrong: for the
+functions ordinary elisp actually calls, the per-operation cost of the
+evaluator is not what is being paid.  `(format "%s" 1)' is 849us against a
+1-31us floor -- roughly forty basic operations' worth of wrapper around one
+5us builtin.
+
+So the lever under option 5 is not "make the evaluator faster".  It is "stop
+paying for a correction layer written in the language the layer exists to
+speed up".  Three shapes, in increasing size:
+
+1. Expose a builtin that already exists.  `arrayp' has `bf_arrayp_raw' and no
+   arm; `nthcdr' had none and got one.  Cheap and local.
+2. Fix the builtin so the wrapper can be thin.  Measured here: the native
+   `substring' arm does not type-check TO.  `(nelisp--native-substring
+   "abcdef" 1 "z")' answers "" -- no error, wrong answer -- because it reads
+   the argument's second word as an integer.  It also accepts a vector, which
+   `bf_arrayp_raw' admits and the string slicing cannot handle; that one
+   fails safely with `args-out-of-range' rather than corrupting memory.  Both
+   are latent, since the wrapper intercepts every call in the tree today, and
+   both are why the wrapper cannot simply delegate.
+3. Move the layer itself into the emitter.  `format' is the case that would
+   pay, and it is also the one with the most exposed semantics: the builtin
+   renders `%S' on a string without quoting it, and `%d'/`%o'/`%x'/`%X' on a
+   non-integer print the argument's raw tagged word rather than signalling --
+   `(nelisp--native-format "%d" (list 1 2))' answered "139734186063984".  A
+   fast path is only sound for templates whose every directive the builtin
+   already renders exactly, which means checking the argument types as well as
+   the template, so it is a real piece of work rather than a guard.
+
+The IME numbers alongside this say the same thing from the other end.  A
+keystroke went from 742ms to 222ms cold and 76ms warm on changes that only
+removed repeated work -- no evaluator change at all.
+
+The harness is `wrap-bench2.el', `sub-bench.el' and `fmt-diff.el'; none is in
+the tree, each is a page of elisp, and each should be re-run rather than
+trusted from here.

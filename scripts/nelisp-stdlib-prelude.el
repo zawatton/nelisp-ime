@@ -599,12 +599,20 @@ from `(defvar X nil)'."
 ;; Stopping exactly ON the non-list tail is not an error at all --
 ;; (nthcdr 1 '(1 . 2)) is 2 -- so the check belongs after the walk.
 (defun nthcdr (n list)
-  (unless (integerp n) (signal 'wrong-type-argument (list 'integerp n)))
-  (let ((i n) (l list))
-    (while (and (> i 0) (consp l)) (setq l (cdr l)) (setq i (1- i)))
-    (cond ((<= i 0) l)
-          ((null l) nil)
-          (t (signal 'wrong-type-argument (list 'listp list))))))
+  ;; The walk itself is `nl--nthcdr', a reader builtin, because doing it here
+  ;; costs an interpreted iteration per element and this is the hottest such
+  ;; loop in the runtime: 330-520us for five elements against 1-31us for a
+  ;; basic operation.  A bignum count keeps the loop below -- the builtin
+  ;; takes fixnums, and no list in memory has a bignum's worth of elements
+  ;; anyway.
+  (if (and (fboundp 'nl--nthcdr) (not (bignump n)))
+      (nl--nthcdr n list)
+    (unless (integerp n) (signal 'wrong-type-argument (list 'integerp n)))
+    (let ((i n) (l list))
+      (while (and (> i 0) (consp l)) (setq l (cdr l)) (setq i (1- i)))
+      (cond ((<= i 0) l)
+            ((null l) nil)
+            (t (signal 'wrong-type-argument (list 'listp list)))))))
 
 ;;; nelisp-stdlib-list.el --- Sweep 9 G1 list operations  -*- lexical-binding: t; -*-
 
@@ -1862,6 +1870,18 @@ Pure-elisp impl: int parse drives a digit loop; float branch uses
 `(/ frac 1.0 ...)' for promote-on-mixed semantics and a multiply
 loop for the exponent (= no `expt' / `float' primitive needed)."
   (nelisp--check-string s)
+  ;; A bare optionally-signed decimal integer -- the shape JSON ids, indices
+  ;; and most counters arrive in -- goes to the native bignum-aware reader
+  ;; entry on the standalone, where the loop below costs ~2 ms per call
+  ;; interpreted.  Anything else (whitespace, a float, a radix, trailing
+  ;; text) keeps the full walk, and the host, which has neither native, is
+  ;; unchanged.
+  (if (and (null radix) (fboundp 'nl--int-token-p) (nl--int-token-p s))
+      (nl--read-int s)
+    (nelisp--string-to-number-walk s radix)))
+
+(defun nelisp--string-to-number-walk (s &optional radix)
+  "The full leading-portion parse behind `string-to-number'."
   (when radix
     (unless (integerp radix) (signal 'wrong-type-argument (list 'fixnump radix)))
     (when (or (< radix 2) (> radix 16))
@@ -2348,6 +2368,19 @@ wider than the one it replaces once the mapping leaves ASCII."
 (defun nelisp--signal-invalid (msg arg)
   (signal 'error (cons msg (if (proper-list-p arg) arg (list arg)))))
 (defun make-hash-table (&rest keys)
+  ;; The validation loop below runs interpreted, and on the standalone that
+  ;; is ~0.5 ms per call -- three times the raw constructor -- paid by every
+  ;; JSON object parsed and every per-reading cache built.  Nearly every
+  ;; caller passes no keys or exactly (:test TEST), so those two shapes are
+  ;; answered here and only the rest go through the loop; a misspelled or
+  ;; dangling keyword still lands in it and still signals.
+  (if (or (null keys)
+          (and (eq (car keys) :test)
+               (memq (cadr keys) '(eq eql equal))
+               (null (cddr keys))))
+      (let ((h (nelisp--hash-table-make-raw)))
+        (aset (car h) 2 (if keys (cadr keys) 'eql))
+        h)
   (let ((ks keys))
     (while ks
       (let ((k (car ks)) (rest (cdr ks)))
@@ -2370,7 +2403,7 @@ wider than the one it replaces once the mapping leaves ASCII."
   (let ((h (nelisp--hash-table-make-raw))
         (test (or (plist-get keys :test) 'eql)))
     (aset (car h) 2 test)
-    h))
+    h)))
 (unless (fboundp 'byte-compile-file)
   (defun byte-compile-file (filename &optional _load)
     "Check FILENAME the way Emacs does and report a missing input file.
@@ -2494,8 +2527,14 @@ reseeds from its characters; nil -> a full LCG value."
         (while (< i n)
           (setq s (logand (+ (* s 31) (aref limit i)) 2147483647) i (1+ i)))
         (setq nelisp--random-state (logand (+ s 1) 2147483647) limit nil)))
+    ;; Split multiply: one-step (* state 1103515245) leaves the fixnum
+    ;; range and `logand' has no bignum path.  Same stream; the why is in
+    ;; test/nelisp-prelude-random-fixnum-test.el.
     (setq nelisp--random-state
-          (logand (+ (* nelisp--random-state 1103515245) 12345) 2147483647))
+          (logand (+ (* (logand (* nelisp--random-state 16838) 32767) 65536)
+                     (* nelisp--random-state 20077)
+                     12345)
+                  2147483647))
     (if (and (integerp limit) (> limit 0))
         (mod nelisp--random-state limit)
       nelisp--random-state)))
@@ -2529,8 +2568,8 @@ reseeds from its characters; nil -> a full LCG value."
     (unless (timerp timer) (signal 'wrong-type-argument (list 'timerp timer)))
     nil))
 (unless (fboundp 'sit-for) (defun sit-for (&rest _) t))
-(unless (fboundp 'cl-dolist) (defmacro cl-dolist (spec &rest body) `(dolist ,spec ,@body)))
-(unless (fboundp 'cl-dotimes) (defmacro cl-dotimes (spec &rest body) `(dotimes ,spec ,@body)))
+(unless (fboundp 'cl-dolist) (defmacro cl-dolist (spec &rest body) `(cl-block nil (dolist ,spec ,@body))))
+(unless (fboundp 'cl-dotimes) (defmacro cl-dotimes (spec &rest body) `(cl-block nil (dotimes ,spec ,@body))))
 (unless (fboundp 'cl-assert)
   (defmacro cl-assert (form &rest _) `(unless ,form (error "Assertion failed: %S" ',form))))
 (unless (fboundp 'cl-check-type)
@@ -3680,19 +3719,26 @@ desugared into a body prelude (unless VAR (setq VAR DEFAULT))."
 ;;
 ;; cl-loop の対応 clause:
 ;;   for VAR in LIST                      list iterator
-;;   for VAR from N to M                  numeric inclusive
-;;   for VAR from N below M               numeric exclusive
-;;   for VAR = INIT then UPDATE          accumulator (deferred)
+;;   for VAR on LIST                      tail iterator
+;;   for VAR across VECTOR                vector iterator
+;;   for VAR [from N] to|below|downto|above M [by S]   numeric iterator
+;;   for VAR = INIT [then UPDATE]         stepped value
 ;;   with VAR = VAL                       binding
+;;   repeat N                             counted iteration
 ;;   do FORM …                            unconditional side-effect
-;;   collect FORM                         accumulate into list
-;;   sum FORM                             accumulate sum
-;;   count FORM                           count truthy
-;;   when COND return FORM                early-exit with FORM
-;;   when COND do FORM                    conditional side-effect
+;;   collect / append / sum / count FORM  accumulators
+;;   always FORM                          t unless FORM is ever nil
+;;   when COND CLAUSE / unless COND CLAUSE  guard the clause that follows
+;;   return FORM                          exit with FORM
 ;;   while COND                           continue while COND non-nil
 ;;   until COND                           continue until COND non-nil
 ;;   bodyless (= no for/with/do keyword)  infinite loop with cl-return
+;;
+;; Several `for' clauses run IN PARALLEL and the loop ends with the first
+;; iterator that runs out, which is what CL does.  That was written once as
+;; `nelisp-cl-macros--loop-build-parallel' and never wired up: the parser
+;; kept one iterator, so a second `for' made the whole shape unrecognised
+;; and -- see below -- unrecognised means nil.
 ;;
 ;; cl-loop は最終的に `cl-block nil (... while ...)' に展開され、
 ;; `cl-return' で抜ける。
@@ -3842,241 +3888,352 @@ wiring DO-FORMS."
                   (cons 'progn rev)
                   step-incr))))))
 
+(defun nelisp-cl-macros--loop-iter-parse (cur)
+  "Parse one `for' clause from CUR, or return nil when it is not one.
+Returns (ITER . REST).  ITER is (:kind KIND :pat PAT ...) describing one
+iterator; parallel `for' clauses each produce one and are stepped
+together, which is what CL does."
+  (when (eq (car cur) 'for)
+    (let ((pat (car (cdr cur)))
+          (kw (car (cdr (cdr cur))))
+          (rest (cdr (cdr (cdr cur)))))
+      (cond
+       ((eq kw 'in)
+        ;; `by STEPFN' walks the list with something other than `cdr', which
+        ;; is how a plist is iterated two cells at a time.
+        (let ((seq (car rest)) (by nil) (tail (cdr rest)))
+          (when (eq (car tail) 'by)
+            (setq by (car (cdr tail)) tail (cdr (cdr tail))))
+          (cons (list :kind 'in :pat pat :seq seq :by by) tail)))
+       ((eq kw 'on)
+        (cons (list :kind 'on :pat pat :seq (car rest)) (cdr rest)))
+       ((eq kw 'across)
+        (cons (list :kind 'across :pat pat :seq (car rest)) (cdr rest)))
+       ((memq kw '(from downfrom upfrom to below downto above by))
+        ;; [from N] to|below|downto|above M [by S].  `from' is optional --
+        ;; CL lets `for i below N' start at 0, and this tree writes seven
+        ;; loops that way.
+        (let ((from 0)
+              (limit-kw nil) (limit nil) (by nil) (down nil)
+              (tail nil))
+          (if (memq kw '(from downfrom upfrom))
+              (setq from (car rest) tail (cdr rest)
+                    down (eq kw 'downfrom))
+            (setq tail (cdr (cdr cur))))
+          (when (memq (car tail) '(to below downto above))
+            (setq limit-kw (car tail) limit (car (cdr tail)) tail (cdr (cdr tail))))
+          (when (eq (car tail) 'by)
+            (setq by (car (cdr tail)) tail (cdr (cdr tail))))
+          (cons (list :kind 'num :pat pat :from from
+                      :limit-kw limit-kw :limit limit :by by :down down)
+                tail)))
+       ((eq kw '=)
+        (let ((init (car rest)) (then nil) (tail (cdr rest)))
+          (when (eq (car tail) 'then)
+            (setq then (car (cdr tail)) tail (cdr (cdr tail))))
+          (cons (list :kind 'eq :pat pat :init init :then then) tail)))
+       (t nil)))))
+
+(defun nelisp-cl-macros--loop-iter-plan (iters first-sym)
+  "Return (BINDS TESTS VARBINDS STEPS) for ITERS.
+BINDS are outer state bindings, TESTS the exhaustion tests, VARBINDS the
+bindings for one step, STEPS the end-of-iteration updates.  VARBINDS are
+sequential: a `for VAR = FORM' clause may read a variable an earlier
+clause bound this iteration, which is what CL promises and the only way
+`for a in L for s = (* a 2)' can work.  FIRST-SYM names the flag that is
+non-nil during the first iteration only, for `= INIT then UPDATE'."
+  (let ((binds nil) (tests nil) (varbinds nil) (steps nil))
+    (while iters
+      (let* ((it (car iters))
+             (kind (plist-get it :kind))
+             (pat (plist-get it :pat)))
+        (cond
+         ((memq kind '(in on))
+          (let ((cur (make-symbol "--loop-cur--")))
+            (setq binds (append binds (list (list cur (plist-get it :seq)))))
+            (setq tests (append tests (list cur)))
+            (setq varbinds
+                  (append varbinds
+                          (let ((src (if (eq kind 'on) cur (list 'car cur))))
+                            (if (symbolp pat)
+                                (list (list pat src))
+                              (nelisp-cl-macros--loop-destructure-bindings pat src)))))
+            (setq steps
+                  (append steps
+                          (list (list 'setq cur
+                                      (let ((by (plist-get it :by)))
+                                        (if by
+                                            (list 'funcall by cur)
+                                          (list 'cdr cur)))))))))
+         ((eq kind 'across)
+          (let ((vec (make-symbol "--loop-vec--"))
+                (idx (make-symbol "--loop-idx--")))
+            (setq binds (append binds (list (list vec (plist-get it :seq))
+                                            (list idx 0))))
+            (setq tests (append tests (list (list '< idx (list 'length vec)))))
+            (setq varbinds (append varbinds (list (list pat (list 'aref vec idx)))))
+            (setq steps (append steps (list (list 'setq idx (list '1+ idx)))))))
+         ((eq kind 'num)
+          (let* ((n (make-symbol "--loop-n--"))
+                 (by (or (plist-get it :by) 1))
+                 (limit-kw (plist-get it :limit-kw))
+                 ;; `downfrom' counts down whatever the limit keyword is, so
+                 ;; `for i downfrom N to M' walks N, N-1, ... M inclusive.
+                 (down (or (plist-get it :down) (memq limit-kw '(downto above))))
+                 (limit (plist-get it :limit)))
+            (setq binds (append binds (list (list n (plist-get it :from)))))
+            (when limit-kw
+              (setq tests
+                    (append tests
+                            (list (list (cond ((eq limit-kw 'to) (if down '>= '<=))
+                                              ((eq limit-kw 'below) (if down '> '<))
+                                              ((eq limit-kw 'downto) '>=)
+                                              (t '>))
+                                        n limit)))))
+            (setq varbinds (append varbinds (list (list pat n))))
+            (setq steps (append steps
+                                (list (list 'setq n
+                                            (list (if down '- '+) n by)))))))
+         ((eq kind 'eq)
+          ;; No outer state and no test: the value is computed each
+          ;; iteration, in scope, so it can read the clauses before it.
+          (setq varbinds
+                (append varbinds
+                        (list (list pat
+                                    (if (plist-get it :then)
+                                        (list 'if first-sym
+                                              (plist-get it :init)
+                                              (plist-get it :then))
+                                      (plist-get it :init)))))))))
+      (setq iters (cdr iters)))
+    (list binds tests varbinds steps)))
+
+(defun nelisp-cl-macros--loop-guard (cond negate form)
+  "Wrap FORM in COND, negated when NEGATE, or return FORM when COND is nil."
+  (cond ((null cond) form)
+        (negate (list 'if cond nil form))
+        (t (list 'if cond form nil))))
+
+(defun nelisp-cl-macros--loop-unsupported (clauses)
+  "Return the expansion for CLAUSES, a shape this subset does not model.
+
+It signals when it RUNS rather than expanding to nil, and rather than
+signalling at expansion time.  Expanding to nil is what made the gap
+dangerous: a loop nobody could build did not fail, it silently did not
+run, and 48 of this repository's 62 `cl-loop' forms were in that state at
+once -- the AOT compiler's stack-argument push loop among them, which
+therefore emitted nothing at all.  Every host test stayed green, because
+the host has the real macro.
+
+Deferring to run time is deliberate: vendor Elisp that merely CONTAINS an
+exotic loop still loads, and only a loop that actually executes fails."
+  (list 'signal (list 'quote 'error)
+        (list 'list "cl-loop: unsupported clause shape" (list 'quote clauses))))
+
+(defun nelisp-cl-macros--loop-unsupported-form-p (form)
+  "Return non-nil when FORM is what `nelisp-cl-macros--loop-unsupported' builds."
+  (and (consp form)
+       (eq (car form) 'signal)
+       (equal (car (cdr (cdr form)))
+              (list 'list "cl-loop: unsupported clause shape"
+                    (car (cdr (cdr (car (cdr (cdr form)))))))) ))
+
 (defun nelisp-cl-macros--loop-build (clauses)
   "Build expansion for `cl-loop' CLAUSES.
 
-See header for supported shapes.  Returns a form that, when the
-shape is unrecognised, expands to nil (= caller gets a no-op
-expansion rather than a runtime error)."
-  (let ((var nil) (list-form nil) (do-forms nil) (collect-form nil)
-        (sum-form nil) (count-form nil) (with-bindings nil)
-        (when-return-cond nil) (when-return-form nil)
-        (when-do-cond nil) (when-do-forms nil)
-        (when-collect-cond nil) (when-collect-form nil)
-        (numeric-from nil) (numeric-to nil) (numeric-below nil)
+Iterators (`for' in / on / across / from ... to|below|downto|above [by] /
+= [then]) are stepped in parallel and the loop ends with the first one
+that runs out.  `when' / `unless' guard the clause that follows.  A shape
+this subset does not model expands to nil, as it always has."
+  (let ((iters nil) (with-bindings nil) (do-forms nil)
+        (acc-kind nil) (acc-form nil)
+        (guard nil) (guard-negate nil)
+        (extra-tests nil) (bodyless-forms nil)
         (repeat-count nil)
-        (while-cond nil) (until-cond nil)
-        (bodyless-forms nil)
+        (first-sym (make-symbol "--loop-first--"))
         (cur clauses) (recognised t))
-    ;; Detect bodyless form: first clause is NOT a known keyword.
     (when (and clauses
                (not (memq (car clauses)
-                          '(for with do collect sum count when
-                                while until repeat finally return
-                                named))))
-      (setq bodyless-forms clauses
-            cur nil
-            recognised t))
+                          '(for with do collect append sum count when unless
+                                while until repeat finally return named
+                                always))))
+      (setq bodyless-forms clauses cur nil))
     (while (and cur recognised)
-      (let ((kw (car cur)))
+      (let ((kw (car cur))
+            (parsed nil))
         (cond
-         ((eq kw 'for)
-          (setq var (car (cdr cur)))
-          (cond
-           ((eq (car (cdr (cdr cur))) 'in)
-            (setq list-form (car (cdr (cdr (cdr cur)))))
-            (setq cur (cdr (cdr (cdr (cdr cur))))))
-           ((eq (car (cdr (cdr cur))) 'from)
-            (setq numeric-from (car (cdr (cdr (cdr cur)))))
-            (let ((kw2 (car (cdr (cdr (cdr (cdr cur))))))
-                  (val2 (car (cdr (cdr (cdr (cdr (cdr cur))))))))
-              (cond
-               ((eq kw2 'to)
-                (setq numeric-to val2)
-                (setq cur (cdr (cdr (cdr (cdr (cdr (cdr cur))))))))
-               ((eq kw2 'below)
-                (setq numeric-below val2)
-                (setq cur (cdr (cdr (cdr (cdr (cdr (cdr cur))))))))
-               (t (setq recognised nil)))))
-           (t (setq recognised nil))))
+         ((and (eq kw 'for)
+               (setq parsed (nelisp-cl-macros--loop-iter-parse cur)))
+          (setq iters (append iters (list (car parsed))) cur (cdr parsed)))
+         ((eq kw 'for) (setq recognised nil))
          ((eq kw 'repeat)
-          (setq repeat-count (car (cdr cur)))
-          (setq cur (cdr (cdr cur))))
-         ((eq kw 'do)
-          (setq do-forms (cons (car (cdr cur)) do-forms))
-          (setq cur (cdr (cdr cur))))
-         ((eq kw 'collect)
-          (setq collect-form (car (cdr cur)))
-          (setq cur (cdr (cdr cur))))
-         ((eq kw 'sum)
-          (setq sum-form (car (cdr cur)))
-          (setq cur (cdr (cdr cur))))
-         ((eq kw 'count)
-          (setq count-form (car (cdr cur)))
-          (setq cur (cdr (cdr cur))))
+          (setq repeat-count (car (cdr cur)) cur (cdr (cdr cur))))
          ((eq kw 'with)
-          (let ((wname (car (cdr cur))))
-            (when (eq (car (cdr (cdr cur))) '=)
-              (setq with-bindings
-                    (append with-bindings
-                            (list (list wname (car (cdr (cdr (cdr cur))))))))
-              (setq cur (cdr (cdr (cdr (cdr cur))))))))
+          (if (eq (car (cdr (cdr cur))) '=)
+              (progn
+                (setq with-bindings
+                      (append with-bindings
+                              (list (list (car (cdr cur))
+                                          (car (cdr (cdr (cdr cur))))))))
+                (setq cur (cdr (cdr (cdr (cdr cur))))))
+            (setq recognised nil)))
+         ((memq kw '(when unless))
+          (setq guard (car (cdr cur))
+                guard-negate (eq kw 'unless)
+                cur (cdr (cdr cur))))
+         ((eq kw 'do)
+          (setq cur (cdr cur))
+          (let ((forms nil))
+            (while (and cur
+                        (not (memq (car cur)
+                                   '(for with do collect append sum count
+                                         when unless while until repeat
+                                         finally return named always and))))
+              (setq forms (append forms (list (car cur))) cur (cdr cur)))
+            ;; `and do' / `and return' continue the same guarded clause, so
+            ;; `when C do X and return Y' returns Y rather than dropping it.
+            (while (and cur (eq (car cur) 'and)
+                        (memq (car (cdr cur)) '(do return)))
+              (if (eq (car (cdr cur)) 'return)
+                  (progn
+                    (setq forms (append forms
+                                        (list (list 'cl-return (car (cdr (cdr cur)))))))
+                    (setq cur (cdr (cdr (cdr cur)))))
+                (setq cur (cdr (cdr cur)))
+                (while (and cur
+                            (not (memq (car cur)
+                                       '(for with do collect append sum count
+                                             when unless while until repeat
+                                             finally return named always and))))
+                  (setq forms (append forms (list (car cur))) cur (cdr cur)))))
+            (setq do-forms
+                  (append do-forms
+                          (list (nelisp-cl-macros--loop-guard
+                                 guard guard-negate (cons 'progn forms)))))
+            (setq guard nil guard-negate nil)))
+         ((memq kw '(collect append sum count))
+          (if (and acc-kind (not (eq acc-kind kw)))
+              (setq recognised nil)
+            (setq acc-kind kw acc-form (car (cdr cur)) cur (cdr (cdr cur)))))
+         ((eq kw 'always)
+          (setq acc-kind 'always acc-form (car (cdr cur)) cur (cdr (cdr cur))))
+         ((eq kw 'return)
+          (setq do-forms
+                (append do-forms
+                        (list (nelisp-cl-macros--loop-guard
+                               guard guard-negate
+                               (list 'cl-return (car (cdr cur)))))))
+          (setq guard nil guard-negate nil cur (cdr (cdr cur))))
          ((eq kw 'while)
-          (setq while-cond (car (cdr cur)))
+          (setq extra-tests (append extra-tests (list (car (cdr cur)))))
           (setq cur (cdr (cdr cur))))
          ((eq kw 'until)
-          (setq until-cond (car (cdr cur)))
+          (setq extra-tests
+                (append extra-tests (list (list 'not (car (cdr cur))))))
           (setq cur (cdr (cdr cur))))
-         ((eq kw 'when)
-          (let ((cond-form (car (cdr cur)))
-                (next-kw (car (cdr (cdr cur))))
-                (next-form (car (cdr (cdr (cdr cur))))))
-            (cond
-             ((eq next-kw 'return)
-              (setq when-return-cond cond-form
-                    when-return-form next-form
-                    cur (cdr (cdr (cdr (cdr cur))))))
-             ((eq next-kw 'do)
-              (setq when-do-cond cond-form
-                    when-do-forms (cons next-form when-do-forms)
-                    cur (cdr (cdr (cdr (cdr cur)))))
-              (while (and cur (eq (car cur) 'and))
-                (let ((and-kw (car (cdr cur)))
-                      (and-form (car (cdr (cdr cur)))))
-                  (cond
-                   ((eq and-kw 'do)
-                    (setq when-do-forms (cons and-form when-do-forms)
-                          cur (cdr (cdr (cdr cur)))))
-                   ((eq and-kw 'collect)
-                    (setq when-collect-cond cond-form
-                          when-collect-form and-form
-                          cur (cdr (cdr (cdr cur)))))
-                   (t (setq recognised nil
-                            cur nil))))))
-             ((eq next-kw 'collect)
-              (setq when-collect-cond cond-form
-                    when-collect-form next-form
-                    cur (cdr (cdr (cdr (cdr cur))))))
-             (t (setq recognised nil)))))
          (t (setq recognised nil)))))
     (cond
-     ((not recognised) nil)
-     ;; Bodyless infinite loop wrapped in cl-block nil.
+     ((not recognised) (nelisp-cl-macros--loop-unsupported clauses))
      (bodyless-forms
-      (list 'cl-block nil
-            (cons 'while
-                  (cons t bodyless-forms))))
-     ;; Numeric `for VAR from N {to,below} M' [do/collect/sum/count FORM ...]
-     ((and numeric-from (or numeric-to numeric-below))
-      (let ((cmp (if numeric-to '<= '<))
-            (limit (or numeric-to numeric-below)))
-        (nelisp-cl-macros--loop-build-counted
-         (list var numeric-from) (list cmp var limit)
-         (list 'setq var (list '1+ var))
-         collect-form sum-form count-form do-forms with-bindings)))
-     ;; `repeat N' [do/collect/sum/count FORM ...] -- unconditional count,
-     ;; no loop variable.
-     (repeat-count
-      (let ((n-sym (make-symbol "--loop-n--")))
-        (nelisp-cl-macros--loop-build-counted
-         (list n-sym repeat-count) (list '> n-sym 0)
-         (list 'setq n-sym (list '1- n-sym))
-         collect-form sum-form count-form do-forms with-bindings)))
-     ;; While / until plain loops (= no iterator).
-     (while-cond
-      (let ((rev nil))
-        (while do-forms (setq rev (cons (car do-forms) rev))
-               (setq do-forms (cdr do-forms)))
-        (list 'let with-bindings
-              (cons 'while (cons while-cond rev)))))
-     (until-cond
-      (let ((rev nil))
-        (while do-forms (setq rev (cons (car do-forms) rev))
-               (setq do-forms (cdr do-forms)))
-        (list 'let with-bindings
-              (cons 'while (cons (list 'not until-cond) rev)))))
-     ;; `for VAR in LIST when COND return FORM' — early exit pattern.
-     (when-return-cond
-      (let ((tag-sym (make-symbol "--loop-tag--"))
-            (result-sym (make-symbol "--loop-r--"))
-            (loop-var (if (symbolp var) var (make-symbol "--loop-item--"))))
-        (list 'let (cons (list result-sym nil) with-bindings)
-              (list 'catch (list 'quote tag-sym)
-                    (list 'dolist (list loop-var list-form)
-                          (nelisp-cl-macros--loop-wrap-body
-                           var loop-var
-                           (list (list 'when when-return-cond
-                                       (list 'setq result-sym when-return-form)
-                                       (list 'throw (list 'quote tag-sym) nil))))))
-              result-sym)))
-     ;; `for VAR in LIST collect FORM'
-     ((or collect-form when-collect-cond)
-      (let ((acc-sym (make-symbol "--loop-acc--"))
-            (loop-var (if (symbolp var) var (make-symbol "--loop-item--")))
-            (body nil)
-            (rev nil))
-        (when collect-form
-          (setq body
-                (append body
-                        (list (list 'setq acc-sym
-                                    (list 'cons collect-form acc-sym))))))
-        (when when-do-cond
-          (while when-do-forms
-            (setq rev (cons (car when-do-forms) rev))
-            (setq when-do-forms (cdr when-do-forms)))
-          (setq body
-                (append body
-                        (list (cons 'when
-                                    (cons when-do-cond rev))))))
-        (when when-collect-cond
-          (setq body
-                (append body
-                        (list (list 'when when-collect-cond
-                                    (list 'setq acc-sym
-                                          (list 'cons when-collect-form acc-sym)))))))
-        (list 'let (cons (list acc-sym nil) with-bindings)
-              (list 'dolist (list loop-var list-form)
-                    (nelisp-cl-macros--loop-wrap-body var loop-var body))
-              (list 'nreverse acc-sym))))
-     ;; `for VAR in LIST sum FORM'
-     (sum-form
-      (let ((acc-sym (make-symbol "--loop-sum--"))
-            (loop-var (if (symbolp var) var (make-symbol "--loop-item--"))))
-        (list 'let (cons (list acc-sym 0) with-bindings)
-              (list 'dolist (list loop-var list-form)
-                    (nelisp-cl-macros--loop-wrap-body
-                     var loop-var
-                     (list (list 'setq acc-sym (list '+ acc-sym sum-form)))))
-              acc-sym)))
-     ;; `for VAR in LIST count FORM'
-     (count-form
-      (let ((acc-sym (make-symbol "--loop-count--"))
-            (loop-var (if (symbolp var) var (make-symbol "--loop-item--"))))
-        (list 'let (cons (list acc-sym 0) with-bindings)
-              (list 'dolist (list loop-var list-form)
-                    (nelisp-cl-macros--loop-wrap-body
-                     var loop-var
-                     (list (list 'when count-form
-                                 (list 'setq acc-sym (list '+ acc-sym 1))))))
-              acc-sym)))
-     ;; `for VAR in LIST when COND do FORM …'
-     (when-do-cond
-      (let ((rev nil)
-            (loop-var (if (symbolp var) var (make-symbol "--loop-item--"))))
-        (while when-do-forms
-          (setq rev (cons (car when-do-forms) rev))
-          (setq when-do-forms (cdr when-do-forms)))
-        (list 'let with-bindings
-              (list 'dolist (list loop-var list-form)
-                    (nelisp-cl-macros--loop-wrap-body
-                     var loop-var
-                     (list (cons 'when (cons when-do-cond rev))))))))
-     ;; `for VAR in LIST do FORM …'
-     (do-forms
-      (let ((rev nil)
-            (loop-var (if (symbolp var) var (make-symbol "--loop-item--"))))
-        (while do-forms (setq rev (cons (car do-forms) rev))
-               (setq do-forms (cdr do-forms)))
-        (list 'let with-bindings
-              (list 'dolist (list loop-var list-form)
-                    (nelisp-cl-macros--loop-wrap-body var loop-var rev)))))
-     (t (list 'let with-bindings nil)))))
+      (list 'cl-block nil (cons 'while (cons t bodyless-forms))))
+     ;; `cl-loop while COND do ...' has no iterator and is still a loop.  The
+     ;; branch for it was lost when the iterators were generalised, and
+     ;; nothing caught that: no form in this tree is written that way, so the
+     ;; body simply stopped running -- the same silent shape this rewrite
+     ;; existed to remove.
+     ((and (null iters) (null repeat-count) (null extra-tests))
+      (nelisp-cl-macros--loop-unsupported clauses))
+     (t
+      (when repeat-count
+        (setq iters (append iters
+                            (list (list :kind 'num
+                                        :pat (make-symbol "--loop-r--")
+                                        :from 1 :limit-kw 'to
+                                        :limit repeat-count :by nil)))))
+      (let* ((plan (nelisp-cl-macros--loop-iter-plan iters first-sym))
+             (binds (nth 0 plan))
+             (tests (nth 1 plan))
+             (varbinds (nth 2 plan))
+             (steps (nth 3 plan))
+             (going (and extra-tests (make-symbol "--loop-going--")))
+             (acc (and acc-kind (make-symbol "--loop-acc--")))
+             (acc-init (cond ((memq acc-kind '(sum count)) 0)
+                             ((eq acc-kind 'always) t)
+                             (t nil)))
+             (acc-body
+              (cond
+               ((eq acc-kind 'collect) (list 'setq acc (list 'cons acc-form acc)))
+               ((eq acc-kind 'append)
+                (list 'setq acc (list 'cons (list 'append acc-form nil) acc)))
+               ((eq acc-kind 'sum) (list 'setq acc (list '+ acc acc-form)))
+               ((eq acc-kind 'count)
+                (list 'when acc-form (list 'setq acc (list '+ acc 1))))
+               ((eq acc-kind 'always)
+                (list 'unless acc-form (list 'cl-return nil)))))
+             (body (append (if acc-body
+                               (list (nelisp-cl-macros--loop-guard
+                                      guard guard-negate acc-body))
+                             nil)
+                           do-forms))
+             ;; `while' / `until' read the iteration variables, so they are
+             ;; tested inside the per-iteration bindings, not in the `while'
+             ;; head where those names do not exist yet.
+             (guarded-body
+              (if extra-tests
+                  (list (list 'if (cons 'and extra-tests)
+                              (cons 'progn (or body (list nil)))
+                              (list 'setq going nil)))
+                body))
+             (result (cond ((eq acc-kind 'collect) (list 'nreverse acc))
+                           ((eq acc-kind 'append)
+                            (list 'apply (list 'quote 'append) (list 'nreverse acc)))
+                           ((memq acc-kind '(sum count)) acc)
+                           ((eq acc-kind 'always) t)
+                           (t nil)))
+             (all-binds (append (if acc (list (list acc acc-init)) nil)
+                                (if going (list (list going t)) nil)
+                                (list (list first-sym t))
+                                binds with-bindings))
+             (head (if going
+                       (cons 'and (cons going tests))
+                     (if tests (cons 'and tests) t)))
+             (loop-form
+              (cons 'while
+                    (cons head
+                          (append
+                           (list (cons 'let* (cons varbinds guarded-body)))
+                           (if going
+                               (list (cons 'when
+                                           (cons going
+                                                 (append steps
+                                                         (list (list 'setq first-sym nil))))))
+                             (append steps (list (list 'setq first-sym nil)))))))))
+        (list 'cl-block nil
+              (cons 'let (cons all-binds
+                               (append (list loop-form)
+                                       (if result (list result) nil))))))))))
+
+(defun nelisp-cl-macros--loop-unbuildable-p (clauses)
+  "Return non-nil when CLAUSES are a shape this subset does not model."
+  (nelisp-cl-macros--loop-unsupported-form-p
+   (nelisp-cl-macros--loop-build clauses)))
+
 
 (defmacro cl-loop (&rest clauses)
   "Loop CLAUSES — minimal CL-style iteration macro.
 
 See `nelisp-cl-macros--loop-build' commentary for supported shapes.
-Patterns this stub does not recognise expand to nil."
+A shape this subset does not model expands to a form that SIGNALS when
+it runs, rather than to nil.
+
+Expanding to nil is what made this dangerous: a loop nobody could build
+did not fail, it silently did not run, and 48 of the 62 `cl-loop' forms
+in this repository were in that state at once -- including the AOT
+compiler's stack-argument push loop, which therefore emitted nothing.
+Every host test stayed green throughout, because the host has the real
+macro.  The signal is at run time and not at expansion time on purpose:
+vendor Elisp that merely CONTAINS an exotic loop still loads, and only a
+loop that actually executes can fail."
   (declare (debug (&rest sexp)))
   (nelisp-cl-macros--loop-build clauses))
 
@@ -6346,7 +6503,16 @@ Rust-min migration (= moved out of build-tool/src/eval/special_forms.rs)."
       (signal 'error
               (list (format "encode-coding-string stub: only utf-8 supported, got %S"
                             coding))))
-    str))
+    ;; NOT the identity.  A string's payload is already its UTF-8 bytes, so
+    ;; the CONVERSION is a no-op -- but the RESULT must be a unibyte string,
+    ;; because that is the whole observable difference: `length' counts
+    ;; bytes, `aref' answers a byte, and `multibyte-string-p' answers nil.
+    ;; Returning STR unchanged made `(length (encode-coding-string "\u65e5"
+    ;; 'utf-8 t))' answer 1 where Emacs answers 3, and left every consumer
+    ;; that round-trips through this pair (nelisp-emacs's write-region and
+    ;; sqlite adapter among them) reaching for `string-as-unibyte' directly
+    ;; instead (v1.2.0 parity gap 6).
+    (if (fboundp 'string-as-unibyte) (string-as-unibyte str) str)))
 (unless (fboundp 'decode-coding-string)
   (defun decode-coding-string (str coding &optional _nocopy)
     (nelisp--check-string str)
@@ -6361,7 +6527,10 @@ Rust-min migration (= moved out of build-tool/src/eval/special_forms.rs)."
       (signal 'error
               (list (format "decode-coding-string stub: only utf-8 supported, got %S"
                             coding))))
-    str))
+    ;; The mirror of `encode-coding-string' above: no byte conversion, but
+    ;; the result is a MULTIBYTE string, so `length' counts characters and
+    ;; `aref' answers a codepoint.
+    (if (fboundp 'string-as-multibyte) (string-as-multibyte str) str)))
 ;; `bufferp' used to be a permanent, unconditional `nil' here (Doc 188
 ;; §1.4 -- "no Sexp is a buffer" was true before this file had a buffer
 ;; object).  The real definition lives in the Doc 188 P1 buffer section
@@ -7596,7 +7765,10 @@ No-ops on substrates without `nelisp--syscall-path-int' (the historic stub)."
   (put (car row) 'error-message (car (cdr row)))
   (unless (get (car row) 'error-conditions)
     (put (car row) 'error-conditions (list (car row) 'file-error 'error))))
-(defmacro cl-loop (&rest clauses) (nelisp-cl-macros--loop-build clauses))
+(defmacro cl-loop (&rest clauses)
+  ;; Same contract as the definition above: an unbuildable shape signals
+  ;; when it runs instead of quietly becoming nil.
+  (nelisp-cl-macros--loop-build clauses))
 
 ;; --- Doc 143: wire the elisp Sexp printer into the reader runtime ---------
 ;; prin1-to-string / prin1 were void in the reader (lisp/nelisp-stdlib-prn.el
@@ -8174,17 +8346,164 @@ are numbers; `1.' is the integer 1."
       (setq i (1+ i)))
     plain))
 
+(defun nelisp--rd-hex-digit-value (c)
+  "Return the numeric value of hexadecimal digit C, or nil."
+  (cond
+   ((and (>= c 48) (<= c 57)) (- c 48))
+   ((and (>= c 97) (<= c 102)) (+ 10 (- c 97)))
+   ((and (>= c 65) (<= c 70)) (+ 10 (- c 65)))
+   (t nil)))
+
+(defun nelisp--rd-octal-escape (body pos n)
+  "Decode one to three octal digits in BODY at POS."
+  (let ((end pos) (cap (min n (+ pos 3))))
+    (while (and (< end cap)
+                (let ((c (aref body end))) (and (>= c 48) (<= c 55))))
+      (setq end (1+ end)))
+    (let ((code (string-to-number (substring body pos end) 8)))
+      ;; Octal values through 255 denote bytes.  In particular, keeping
+      ;; meta and high-octal escapes unibyte is observable in GNU Emacs.
+      (cons (if (<= code 255) (unibyte-string code) (char-to-string code))
+            end))))
+
+(defun nelisp--rd-unicode-escape (body pos n digits)
+  "Decode exactly DIGITS hexadecimal characters in BODY at POS."
+  (when (< (- n pos) digits)
+    (signal 'invalid-read-syntax (list "Short Unicode escape")))
+  (let ((end (+ pos digits)) (i pos) (valid t))
+    (while (< i end)
+      (unless (nelisp--rd-hex-digit-value (aref body i)) (setq valid nil))
+      (setq i (1+ i)))
+    (unless valid
+      (signal 'invalid-read-syntax (list "Invalid Unicode escape")))
+    (cons (char-to-string (string-to-number (substring body pos end) 16))
+          end)))
+
+(defun nelisp--rd-named-unicode-escape (body pos n)
+  "Decode GNU's numeric `\\N{U+HEX}' form in BODY at POS."
+  (unless (and (< (1+ pos) n) (= (aref body (1+ pos)) 123))
+    (signal 'invalid-read-syntax (list "Invalid \\N escape")))
+  (let ((end (+ pos 2)))
+    (while (and (< end n) (not (= (aref body end) 125)))
+      (setq end (1+ end)))
+    (when (>= end n)
+      (signal 'invalid-read-syntax (list "Unterminated \\N escape")))
+    (let ((digit-start (+ pos 4)) (i (+ pos 4)) (valid t))
+      ;; Full Unicode character-name lookup needs Emacs's name database,
+      ;; which the standalone does not carry.  The U+ notation is numeric
+      ;; and can be decoded locally without broadening that runtime surface.
+      (unless (and (< digit-start end)
+                   (= (aref body (+ pos 2)) 85)
+                   (= (aref body (+ pos 3)) 43))
+        (signal 'invalid-read-syntax (list "Unknown character name")))
+      (while (< i end)
+        (unless (nelisp--rd-hex-digit-value (aref body i)) (setq valid nil))
+        (setq i (1+ i)))
+      (unless valid
+        (signal 'invalid-read-syntax (list "Invalid character code")))
+      (cons (char-to-string
+             (string-to-number (substring body digit-start end) 16))
+            (1+ end)))))
+
+(defun nelisp--rd-string-ctrl-char (c)
+  "Return GNU's control-code collapse of C, or nil when invalid."
+  (cond
+   ((and (>= c 65) (<= c 90)) (1+ (- c 65)))
+   ((and (>= c 97) (<= c 122)) (1+ (- c 97)))
+   ((= c 63) 127)
+   ((or (= c 64) (= c 32)) 0)
+   ((and (>= c 91) (<= c 95)) (- c 64))
+   (t nil)))
+
+(defun nelisp--rd-basic-string-escape (body pos n)
+  "Decode one non-modifier string escape in BODY at POS."
+  (let ((e (aref body pos)))
+    (cond
+     ((= e 97)  (cons (char-to-string 7) (1+ pos)))
+     ((= e 98)  (cons (char-to-string 8) (1+ pos)))
+     ((= e 100) (cons (char-to-string 127) (1+ pos)))
+     ((= e 101) (cons (char-to-string 27) (1+ pos)))
+     ((= e 102) (cons (char-to-string 12) (1+ pos)))
+     ((= e 110) (cons (char-to-string 10) (1+ pos)))
+     ((= e 114) (cons (char-to-string 13) (1+ pos)))
+     ((= e 115) (cons (char-to-string 32) (1+ pos)))
+     ((= e 116) (cons (char-to-string 9) (1+ pos)))
+     ((= e 118) (cons (char-to-string 11) (1+ pos)))
+     ;; Backslash-newline and backslash-space are continuations in strings.
+     ((or (= e 10) (= e 32)) (cons "" (1+ pos)))
+     ((and (>= e 48) (<= e 55)) (nelisp--rd-octal-escape body pos n))
+     ((= e 120)
+      (let ((end (1+ pos)))
+        (while (and (< end n) (nelisp--rd-hex-digit-value (aref body end)))
+          (setq end (1+ end)))
+        (when (= end (1+ pos))
+          (signal 'invalid-read-syntax (list "Empty hex escape")))
+        (let ((code (string-to-number (substring body (1+ pos) end) 16)))
+          (cons (if (<= code 255) (unibyte-string code) (char-to-string code))
+                end))))
+     ((= e 117) (nelisp--rd-unicode-escape body (1+ pos) n 4))
+     ((= e 85) (nelisp--rd-unicode-escape body (1+ pos) n 8))
+     ((= e 78) (nelisp--rd-named-unicode-escape body pos n))
+     ;; GNU drops the backslash on unknown escapes, retaining the character.
+     (t (cons (char-to-string e) (1+ pos))))))
+
+(defun nelisp--rd-modified-string-escape (body pos n meta ctrl)
+  "Decode a control or meta string escape target in BODY at POS."
+  (when (>= pos n)
+    (signal 'invalid-read-syntax (list "Invalid modifier in string")))
+  (let ((r
+         (if (= (aref body pos) 92)
+             (progn
+               (when (>= (1+ pos) n)
+                 (signal 'invalid-read-syntax
+                         (list "Invalid modifier in string")))
+               (let ((e (aref body (1+ pos))))
+                 (cond
+                  ((and (or (= e 67) (= e 77))
+                        (< (+ pos 2) n) (= (aref body (+ pos 2)) 45))
+                   (nelisp--rd-modified-string-escape
+                    body (+ pos 3) n (or meta (= e 77)) (or ctrl (= e 67))))
+                  ((= e 94)
+                   (nelisp--rd-modified-string-escape
+                    body (+ pos 2) n meta t))
+                  (t (nelisp--rd-basic-string-escape body (1+ pos) n)))))
+           (cons (char-to-string (aref body pos)) (1+ pos)))))
+    (let ((chunk (car r)))
+      (unless (= (length chunk) 1)
+        (signal 'invalid-read-syntax (list "Invalid modifier in string")))
+      (let ((code (aref chunk 0)))
+        (when ctrl
+          (setq code (nelisp--rd-string-ctrl-char code))
+          (unless code
+            (signal 'invalid-read-syntax (list "Invalid modifier in string"))))
+        (when meta
+          ;; GNU permits meta only on an ASCII target and represents it by
+          ;; setting bit 7 in an otherwise-unibyte string.
+          (when (> code 127)
+            (signal 'invalid-read-syntax (list "Invalid modifier in string")))
+          (setq code (logior code 128)))
+        (cons (if meta (unibyte-string code) (char-to-string code))
+              (cdr r))))))
+
+(defun nelisp--rd-string-escape (body pos n)
+  "Decode one GNU-compatible string escape in BODY at POS."
+  (let ((e (aref body pos)))
+    (cond
+     ((and (or (= e 67) (= e 77))
+           (< (1+ pos) n) (= (aref body (1+ pos)) 45))
+      (nelisp--rd-modified-string-escape
+       body (+ pos 2) n (= e 77) (= e 67)))
+     ((= e 94) (nelisp--rd-modified-string-escape body (1+ pos) n nil t))
+     (t (nelisp--rd-basic-string-escape body pos n)))))
+
 (defun nelisp--rd-unescape (body)
   (let ((out "") (i 0) (n (length body)))
     (while (< i n)
       (let ((c (aref body i)))
         (if (and (= c 92) (< (1+ i) n))
-            (let ((d (aref body (1+ i))))
-              (setq out (concat out (cond ((= d 110) "\n") ((= d 116) "\t")
-                                          ((= d 114) "\r") (t (char-to-string d)))))
-              (setq i (+ i 2)))
-          (setq out (concat out (char-to-string c)))
-          (setq i (1+ i)))))
+            (let ((r (nelisp--rd-string-escape body (1+ i) n)))
+              (setq out (concat out (car r)) i (cdr r)))
+          (setq out (concat out (char-to-string c)) i (1+ i)))))
     out))
 
 (defun nelisp--rd-one (s i n)
@@ -8816,14 +9135,80 @@ and only running both says which."
                               out)))))
         (nreverse out)))))
 (unless (fboundp 'make-directory)
+  ;; Three defects fixed together (v1.2.0 parity gap 4), because the first
+  ;; two hid the third:
+  ;;
+  ;; 1. The PARENTS walk rebuilt every path as absolute-POSIX: `acc' started
+  ;;    "" and each component was appended after a "/", so a relative "a/b"
+  ;;    became "/a" + "/a/b" and a Windows "C:/x" became "/C:" + "/C:/x" --
+  ;;    it created (or failed to create) something other than what it was
+  ;;    asked for.
+  ;; 2. Every result was discarded and DIR returned, so a failure was
+  ;;    indistinguishable from success.  On windows-x86_64 the underlying
+  ;;    NR=83 was an unconditional -ENOSYS until this same change, which is
+  ;;    why `make-directory' there was a silent no-op that still answered
+  ;;    its own argument.
+  ;; 3. Emacs returns nil, not DIR.
+  (defun nelisp--make-directory-1 (path)
+    "mkdir PATH once; return the kernel result (0 ok, negative -errno)."
+    (nelisp--syscall-path-int 83 path 511))
+  (defun nelisp--make-directory-prefixes (dir)
+    "Return DIR's ancestor paths, outermost first, then DIR itself.
+Keeps DIR's own root: an absolute POSIX path keeps its leading slash, a
+Windows drive path keeps `C:', and a relative path stays relative."
+    (let* ((abs (and (> (length dir) 0) (eq (aref dir 0) ?/)))
+           (parts (nelisp--split-on-char dir 47 t))
+           (acc (if abs "" nil))
+           (out nil))
+      (while parts
+        (setq acc (cond ((null acc) (car parts))
+                        ((equal acc "") (concat "/" (car parts)))
+                        (t (concat acc "/" (car parts)))))
+        (setq out (cons acc out))
+        (setq parts (cdr parts)))
+      (nreverse out)))
   (defun make-directory (dir &optional parents)
+    (nelisp--check-string dir)
     (if parents
-        (let ((acc ""))
-          (dolist (component (nelisp--split-on-char dir 47 t))
-            (setq acc (concat acc "/" component))
-            (nelisp--syscall-path-int 83 acc 511)))
-      (nelisp--syscall-path-int 83 dir 511))
-    dir))
+        ;; Ancestors may already exist; only the final component's failure
+        ;; is worth reporting, and even that is fine when it exists.
+        (let ((paths (nelisp--make-directory-prefixes dir)))
+          (while paths
+            (let ((rc (nelisp--make-directory-1 (car paths))))
+              (when (and (null (cdr paths)) (< rc 0)
+                         (not (file-directory-p (car paths))))
+                (signal 'file-error
+                        (list "Creating directory" "No such file or directory"
+                              dir))))
+            (setq paths (cdr paths))))
+      ;; Emacs distinguishes the two failures, and so does the errno the
+      ;; substrate hands back: -EEXIST is `file-already-exists', anything
+      ;; else (a missing parent, a permission refusal) is `file-error'.
+      (let ((rc (nelisp--make-directory-1 dir)))
+        (when (< rc 0)
+          (if (= rc -17)
+              (signal 'file-already-exists
+                      (list "Creating directory" "File exists" dir))
+            (signal 'file-error
+                    (list "Creating directory" "No such file or directory"
+                          dir))))))
+    nil))
+
+;; `kill-emacs' -- terminate the process now (v1.2.0 parity gap 3).  The
+;; reader's own `exit' only records an exit STATUS: execution continues to
+;; the end of the current form and on through the rest of the file, which
+;; is not what any caller of `kill-emacs' means.  `nelisp--exit-process'
+;; is the immediate one; keep `exit''s status-only contract untouched,
+;; since the driver's own top-level loop is built on it.
+(unless (fboundp 'kill-emacs)
+  (defun kill-emacs (&optional arg _restart)
+    "Exit the process immediately with status ARG (default 0)."
+    (let ((code (if (integerp arg) arg 0)))
+      (if (fboundp 'nelisp--exit-process)
+          (nelisp--exit-process code)
+        ;; No immediate-exit primitive: fall back to the status-only `exit'
+        ;; so at least the exit code is right when the form returns.
+        (exit code)))))
 ;; Native-store file builtins via direct syscalls (pure elisp, no Rust).
 ;; x86_64 Linux numbers, matching the access=21/unlink=87/mkdir=83/rmdir=84
 ;; convention above: rename=82, symlink=88, chmod=90, access(X_OK)=21.
@@ -9531,32 +9916,46 @@ it here turned that call into a `wrong-number-of-arguments'.  Both indices
 are checked for integerness BEFORE any range arithmetic, so
 (substring \"abcdef\" 12354 \"z\") names \"z\" rather than reporting a range
 computed from it."
-  (unless (arrayp seq) (signal 'wrong-type-argument (list 'arrayp seq)))
-  (when from
-    (unless (integerp from) (signal 'wrong-type-argument (list 'integerp from))))
-  (when to
-    (unless (integerp to) (signal 'wrong-type-argument (list 'integerp to))))
-  (setq from (or from 0))
-  (if (vectorp seq)
-      (let* ((n (length seq))
-             (s (if (< from 0) (+ n from) from))
-             (e (if to (if (< to 0) (+ n to) to) n))
-             ;; The string path signals for an index outside the sequence;
-             ;; the vector path used to build a vector of negative length
-             ;; instead, so it failed later and somewhere else.
-             (_ (when (or (< s 0) (> s n) (< e 0) (> e n) (> s e))
-                  (signal 'args-out-of-range (list seq from to))))
-             (out (make-vector (- e s) nil))
-             (i 0))
-        (while (< (+ s i) e)
-          (aset out i (aref seq (+ s i)))
-          (setq i (1+ i)))
-        out)
-    ;; String path: native `substring' returns "" when TO is passed as an
-    ;; explicit nil, so only forward the 3rd argument when it was supplied.
-    (if to
-        (nelisp--native-substring seq from to)
-      (nelisp--native-substring seq from))))
+  ;; The string case is the one ordinary elisp writes, and it is the one the
+  ;; native arm already decides completely: it signals `arrayp' for a
+  ;; non-array, `integerp' for a non-integer FROM or TO, and
+  ;; `args-out-of-range' for an index outside the string, in that order.  So
+  ;; the guards below are not repeated for it.  They were not free: `arrayp'
+  ;; alone is `(or (vectorp x) (stringp x))' in elisp, and the four of them
+  ;; together made this function 82us against 3us for the arm underneath.
+  ;; A vector still takes the long way, because the arm slices with string
+  ;; primitives and cannot do one.
+  (if (stringp seq)
+      (if to
+          (nelisp--native-substring seq (or from 0) to)
+        (nelisp--native-substring seq (or from 0)))
+    (progn
+      (unless (arrayp seq) (signal 'wrong-type-argument (list 'arrayp seq)))
+      (when from
+        (unless (integerp from) (signal 'wrong-type-argument (list 'integerp from))))
+      (when to
+        (unless (integerp to) (signal 'wrong-type-argument (list 'integerp to))))
+      (setq from (or from 0))
+      (if (vectorp seq)
+	  (let* ((n (length seq))
+		 (s (if (< from 0) (+ n from) from))
+		 (e (if to (if (< to 0) (+ n to) to) n))
+		 ;; The string path signals for an index outside the sequence;
+		 ;; the vector path used to build a vector of negative length
+		 ;; instead, so it failed later and somewhere else.
+		 (_ (when (or (< s 0) (> s n) (< e 0) (> e n) (> s e))
+                      (signal 'args-out-of-range (list seq from to))))
+		 (out (make-vector (- e s) nil))
+		 (i 0))
+            (while (< (+ s i) e)
+              (aset out i (aref seq (+ s i)))
+              (setq i (1+ i)))
+            out)
+        ;; Not a vector and not a string: an array this build does not know.
+        ;; The arm answers for it, and signals if it cannot.
+        (if to
+            (nelisp--native-substring seq from to)
+          (nelisp--native-substring seq from))))))
 
 ;; ---- Doc 22 reader-core gap fixes, iteration 2 (A7/A13) ----
 

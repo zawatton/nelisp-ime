@@ -1054,6 +1054,7 @@ STANDALONE_READER_SMOKES = \
   standalone-reader-async-core-smoke \
   standalone-reader-bignum-smoke \
   standalone-reader-catch-throw-tag-smoke \
+  standalone-reader-cl-dolist-return-smoke \
   standalone-reader-checked \
   standalone-reader-checked-soak \
   standalone-reader-cond-let-shape-smoke \
@@ -1069,6 +1070,7 @@ STANDALONE_READER_SMOKES = \
   standalone-reader-fmt-smoke \
   standalone-reader-getenv-smoke \
   standalone-reader-hosts-file-smoke \
+  standalone-reader-host-parity-smoke \
   standalone-reader-intern-soft-loop-smoke \
   standalone-reader-intern-soft-smoke \
   standalone-reader-load-smoke \
@@ -1094,6 +1096,7 @@ STANDALONE_READER_SMOKES = \
   standalone-reader-repl-idle-pump-smoke \
   standalone-reader-repl-smoke \
   standalone-reader-require-provide-smoke \
+  standalone-reader-read-string-escapes-smoke \
   standalone-reader-shadow-smoke \
   standalone-reader-splitstring-perf-smoke \
   standalone-reader-tls-smoke \
@@ -1562,6 +1565,22 @@ standalone-reader-reader-parity-smoke: $(if $(wildcard target/nelisp target/neli
 	  *"pass=t"*) echo "[reader-parity-smoke] PASS: $$out";; \
 	  *) echo "[reader-parity-smoke] FAIL: $$out (expected pass=t -- the native reader and nelisp--rd-one disagree)"; exit 1;; \
 	esac
+
+# The standalone has a second, interpreted reader behind `read-from-string'.
+# Its string decoder used to recognize only \n, \r, and \t, so source loaded
+# through it silently changed \0 to the digit 0 and missed the other GNU
+# string escapes.  Construct the reader inputs from character codes so this
+# smoke tests `read-from-string' itself, not the native reader that loads the
+# smoke expression.
+.PHONY: standalone-reader-read-string-escapes-smoke
+standalone-reader-read-string-escapes-smoke: standalone-reader
+	@out="$$($(STANDALONE_BIN) --eval '(list (string-to-list (car (read-from-string (apply (function string) (quote (34 120 92 48 121 34)))))) (string-to-list (car (read-from-string (apply (function string) (quote (34 92 48 49 50 34)))))) (string-to-list (car (read-from-string (apply (function string) (quote (34 92 120 52 49 34)))))) (let ((s (car (read-from-string (apply (function string) (quote (34 233 34))))))) (list (string-to-list s) (multibyte-string-p s))) (string-to-list (car (read-from-string (apply (function string) (quote (34 92 67 45 97 34)))))) (string-to-list (car (read-from-string (apply (function string) (quote (34 92 115 34)))))) (string-to-list (car (read-from-string (apply (function string) (quote (34 120 92 10 121 34)))))))')"; \
+	if [ "$$out" = "((120 0 121) (10) (65) ((233) t) (1) (32) (120 121))" ]; then \
+	  echo "[read-string-escapes-smoke] PASS: -> $$out"; \
+	else \
+	  echo "[read-string-escapes-smoke] FAIL: -> $$out"; \
+	  exit 1; \
+	fi
 
 # Doc 201 §5.3: §5.1 replaced `nl_sf_defvar'/`nl_sf_defconst''s per-call AST
 # synthesis (intern 5 symbols, build 9 cons cells, re-enter the interpreter
@@ -2084,6 +2103,77 @@ standalone-reader-recursion-guard-smoke: standalone-reader
 # startup step connecting that alist to the process.  Everything keyed on the
 # environment was therefore dead, the native-exec cache root among them --
 # it fell past XDG_CACHE_HOME and HOME to /tmp on every run.
+.PHONY: standalone-reader-host-parity-smoke
+# The six host-Emacs parity gaps v1.2.0 shipped with, each of which had let a
+# consumer fail somewhere far away from its cause (v1.2.1; see
+# docs/design/138 "Host parity").  One target so a regression in any of them
+# is one red line naming which:
+#
+#   1 `load' binds `load-file-name' -- and restores it, nesting included.
+#   2 `load' searches `load-path' for a relative name, `.el' first.
+#   3 `kill-emacs' terminates NOW (`exit' only records a status).
+#   4 `make-directory' really creates, keeps the path's own root, and
+#     reports EEXIST apart from every other failure.
+#   5 `rdf' answers nil for a file it cannot open, "" only for an empty one.
+#   6 `encode-coding-string' / `decode-coding-string' are a real
+#     unibyte/multibyte pair, not the identity.
+#
+# Each assertion is a VALUE, not an exit status: every one of these answered
+# something plausible-looking before, which is exactly why they survived a
+# release.
+standalone-reader-host-parity-smoke: standalone-reader
+	@mkdir -p target/host-parity/lp
+	@printf '%s\n' '(setq probe load-file-name)' > target/host-parity/lp/hp-lfn.el
+	@printf '%s\n' '(setq plain-hit t)' > target/host-parity/lp/hp-plain
+	@printf '%s\n' \
+	  '(setq load-path (cons "target/host-parity/lp" load-path))' \
+	  '(setq probe (quote unset) plain-hit nil)' \
+	  '(setq r-load (load "hp-lfn" nil t))' \
+	  '(setq r-lfn (equal probe "target/host-parity/lp/hp-lfn.el"))' \
+	  '(setq r-restored (null load-file-name))' \
+	  '(setq r-plain (progn (load "hp-plain" nil t) plain-hit))' \
+	  '(setq r-missing (condition-case e (progn (load "hp-no-such-4f1c" nil nil) (quote NO-SIGNAL)) (error (car e))))' \
+	  '(setq r-noerror (load "hp-no-such-4f1c" t nil))' \
+	  '(setq r-rdf-missing (rdf "target/host-parity/no-such-4f1c"))' \
+	  '(setq r-rdf-real (stringp (rdf "target/host-parity/lp/hp-lfn.el")))' \
+	  '(setq src (string 97 26085))' \
+	  '(setq enc (encode-coding-string src (quote utf-8) t))' \
+	  '(setq r-enc (list (length enc) (multibyte-string-p enc)))' \
+	  '(setq dec (decode-coding-string enc (quote utf-8) t))' \
+	  '(setq r-dec (list (length dec) (multibyte-string-p dec) (aref dec 1) (equal dec src)))' \
+	  '(setq r-mkdir (progn (make-directory "target/host-parity/a/b/c" t) (file-directory-p "target/host-parity/a/b/c")))' \
+	  '(setq r-mkdir-root (file-directory-p "target/host-parity/a/b"))' \
+	  '(setq r-mkdir-exists (condition-case e (progn (make-directory "target/host-parity/a/b/c") (quote NO-SIGNAL)) (error (car e))))' \
+	  '(setq r-kill (fboundp (quote kill-emacs)))' \
+	  '(list r-load r-lfn r-restored r-plain r-missing r-noerror r-rdf-missing r-rdf-real r-enc r-dec r-mkdir r-mkdir-root r-mkdir-exists r-kill)' \
+	  > target/standalone-reader-host-parity-smoke.el
+	@rm -rf target/host-parity/a
+	@out="$$($(STANDALONE_BIN) --load target/standalone-reader-host-parity-smoke.el)"; \
+	expected='(t t t t file-missing nil nil t (4 nil) (2 t 26085 t) t t file-already-exists t)'; \
+	if [ "$$out" = "$$expected" ]; then \
+	  echo "[host-parity] PASS: load-file-name / load-path / rdf nil / coding pair / make-directory / kill-emacs -> $$out"; \
+	else \
+	  echo "[host-parity] FAIL: -> $$out"; \
+	  echo "[host-parity]       expected $$expected"; \
+	  exit 1; \
+	fi
+	@printf '%s\n' '(nelisp--write-stdout-bytes "reached\n")' '(kill-emacs 7)' '(nelisp--write-stdout-bytes "PAST-KILL-EMACS\n")' '0' \
+	  > target/standalone-reader-host-parity-kill.el
+	@out="$$($(STANDALONE_BIN) target/standalone-reader-host-parity-kill.el || true)"; \
+	if [ "$$out" = "reached" ]; then \
+	  echo "[host-parity] PASS: kill-emacs stops execution (no PAST-KILL-EMACS)"; \
+	else \
+	  echo "[host-parity] FAIL: kill-emacs did not stop execution -> $$out"; exit 1; \
+	fi
+	@$(STANDALONE_BIN) target/standalone-reader-host-parity-kill.el >/dev/null 2>&1; \
+	rc=$$?; \
+	if [ "$$rc" = "7" ]; then \
+	  echo "[host-parity] PASS: kill-emacs exit status 7"; \
+	else \
+	  echo "[host-parity] FAIL: kill-emacs exit status $$rc (expected 7)"; exit 1; \
+	fi
+	@echo "[standalone-reader-host-parity-smoke] PASS: all six v1.2.0 host-parity gaps"
+
 .PHONY: standalone-reader-getenv-smoke
 # The environment the parent set must reach `getenv' inside the standalone
 # (fix/windows-env-inherit).  Two variables, because the two halves fail
@@ -2388,6 +2478,23 @@ standalone-reader-catch-throw-tag-smoke: standalone-reader
 	  exit 1; \
 	fi
 
+# GNU `cl-dolist' and `cl-dotimes' establish an anonymous `cl-block'.  The
+# prelude shims used to drop that wrapper, so a body-level `cl-return' escaped
+# as `no-catch: (cl-block-anon VALUE)'.  Cover value returns, fall-through
+# results, and nested anonymous blocks (the outer loop must keep iterating).
+standalone-reader-cl-dolist-return-smoke: standalone-reader
+	@mkdir -p target
+	@printf '%s\n' \
+	  '(list (cl-dolist (x (quote (1 2 3)) (quote missed)) (if (= x 2) (cl-return (list (quote dolist) x)))) (cl-dolist (x (quote (1 2)) (quote done))) (cl-dotimes (i 3 (quote missed)) (if (= i 2) (cl-return (list (quote dotimes) i)))) (cl-dotimes (i 3)) (let ((seen nil)) (cl-dolist (x (quote (1 2))) (setq seen (cons (cl-dolist (y (quote (3 4)) (quote missed)) (cl-return (list x y))) seen))) (reverse seen)))' \
+	  > target/standalone-reader-cl-dolist-return-smoke.el
+	@out="$$($(STANDALONE_BIN) --load target/standalone-reader-cl-dolist-return-smoke.el)"; \
+	if [ "$$out" = "((dolist 2) done (dotimes 2) nil ((1 3) (2 3)))" ]; then \
+	  echo "[standalone-reader-cl-dolist-return-smoke] PASS: -> $$out"; \
+	else \
+	  echo "[standalone-reader-cl-dolist-return-smoke] FAIL: -> $$out"; \
+	  exit 1; \
+	fi
+
 # End-to-end regression for the same root cause, shaped exactly like vendor
 # cond-let.el's `cond-let--prepare-clauses' / `cond-let--when-let*' /
 # `cond-let--when-let' (magit #17 M2 blocker; nelisp-emacs-lib Doc 33 item
@@ -2566,6 +2673,13 @@ endif
 	  echo "[ffi-smoke f64 mixed] PASS: pow(2,10)=1024 / ldexp(1.5,3 :: f64+i64)=12 / hypot(3,4)=5 -> $$out"; \
 	else \
 	  echo "[ffi-smoke f64 mixed] FAIL: -> $$out (expected (t t t))"; exit 1; \
+	fi
+	@printf '%s\n' '(let* ((cs (lambda (s) (let ((p (alloc-bytes (1+ (length s)) 1)) (i 0)) (while (< i (length s)) (ptr-write-u8 p i (aref s i)) (setq i (1+ i))) (ptr-write-u8 p (length s) 0) p))) (dbp (alloc-bytes 8 8)) (rc (nl-ffi-call "sqlite3_open_v2" (funcall cs ":memory:") dbp 6 0)) (db (ptr-read-u64 dbp 0)) (stp (alloc-bytes 8 8)) (rp (nl-ffi-call "sqlite3_prepare_v2" db (funcall cs "select 6*7, 2.5, '"'"'ok'"'"'") -1 stp 0)) (st (ptr-read-u64 stp 0)) (step (nl-ffi-call "sqlite3_step" st)) (v (nl-ffi-call "sqlite3_column_int64" st 0)) (d (nl-ffi-call "sqlite3_column_double" st 1)) (tp (nl-ffi-call "sqlite3_column_text" st 2)) (txt (unibyte-string (ptr-read-u8 tp 0) (ptr-read-u8 tp 1)))) (nl-ffi-call "sqlite3_finalize" st) (nl-ffi-call "sqlite3_close_v2" db) (list rc rp step v (= d 2.5) txt))' > target/standalone-reader-ffi-sqlite.el
+	@out="$$($(STANDALONE_BIN) --load target/standalone-reader-ffi-sqlite.el)"; \
+	if [ "$$out" = '(0 0 100 42 t "ok")' ]; then \
+	  echo "[ffi-smoke S1 sqlite] PASS: open(:memory:)+prepare+step+column_{int64,double,text} -> $$out"; \
+	else \
+	  echo "[ffi-smoke S1 sqlite] FAIL: -> $$out (expected (0 0 100 42 t \"ok\"))"; exit 1; \
 	fi
 ifeq ($(STANDALONE_GATE_TARGET),windows-x86_64)
 	@echo "[ffi-smoke D1 gnutls] SKIP: Windows external TLS policy is Stage D2"
@@ -3617,7 +3731,7 @@ standalone-reader-prelude-test:
 #   make standalone-tarball PLATFORM=linux-x86_64
 #   make standalone-tarball PLATFORM=macos-aarch64
 #   make standalone-tarball-verify PLATFORM=linux-x86_64
-STANDALONE_VERSION ?= $(shell tr -d " \t\n\r" < $(CURDIR)/VERSION 2>/dev/null || echo v1.2.0)
+STANDALONE_VERSION ?= $(shell tr -d " \t\n\r" < $(CURDIR)/VERSION 2>/dev/null || echo v1.2.1)
 standalone-tarball:
 	@./tools/build-standalone-tarball.sh $(STANDALONE_VERSION) $(PLATFORM) --emacs "$(EMACS)"
 
