@@ -112,9 +112,9 @@ calls are repeats.
 The key space is the dictionary's surfaces rather than anything the user
 types, which is why the preedit and pending fields are NOT cached here:
 those are unbounded in a long session, and they are two calls a keystroke
-against thirty.  Cleared by `nelisp-ime-stateline-cache-clear'.")
+against thirty.  Cleared by `nelisp-ime-stateline--cache-clear'.")
 
-(defun nelisp-ime-stateline-cache-clear ()
+(defun nelisp-ime-stateline--cache-clear ()
   "Forget every cached candidate hex encoding."
   (clrhash nelisp-ime-stateline--candidate-hex)
   nil)

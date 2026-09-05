@@ -167,8 +167,8 @@ nothing about the cache at all."
       (puthash "橋" "poisoned" nelisp-ime-stateline--candidate-hex)
       (should-not (equal (nelisp-ime-stateline--candidates snapshot) honest))
       ;; And clearing it restores the honest answer, which is what
-      ;; `nelisp-ime-stateline-cache-clear' is for.
-      (nelisp-ime-stateline-cache-clear)
+      ;; `nelisp-ime-stateline--cache-clear' is for.
+      (nelisp-ime-stateline--cache-clear)
       (should (= (hash-table-count nelisp-ime-stateline--candidate-hex) 0))
       (should (equal (nelisp-ime-stateline--candidates snapshot) honest)))))
 
