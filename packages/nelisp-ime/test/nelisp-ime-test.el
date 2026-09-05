@@ -443,5 +443,46 @@
     ;; Asking for full must not make the session full from then on.
     (should (equal (plist-get (nelisp-ime-session-status "s") :candidates) []))))
 
+(ert-deftest nelisp-ime-test-selection-answer-carries-the-list ()
+  "A selection answers with the list it was selected from, even when compact.
+This is why the selection path forces full detail at all, so it is checked
+before the test that the forcing does not stick."
+  (nelisp-ime-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸" "端")))
+    (nelisp-ime-session-open "s" '(:detail compact))
+    (nelisp-ime-feed "s" '(:op :insert :text "はし"))
+    (let ((answer (nelisp-ime-feed "s" '(:op :select-candidate :index 1))))
+      (should-not (equal (plist-get answer :candidates) []))
+      (should (equal (plist-get answer :preedit) "箸")))))
+
+(ert-deftest nelisp-ime-test-selection-does-not-upgrade-the-session ()
+  "Forcing full detail for a selection must not outlive the answer.
+`plist-put' mutates in place, and the plist it mutates is the session in
+`nelisp-ime-sessions', so a compact session that selected a candidate once
+used to carry full segments and candidates on every snapshot afterwards --
+the same defect `nelisp-ime--finish' records for commits."
+  (nelisp-ime-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸" "端")))
+    (nelisp-ime-session-open "s" '(:detail compact))
+    (nelisp-ime-feed "s" '(:op :insert :text "はし"))
+    (nelisp-ime-feed "s" '(:op :select-candidate :index 1))
+    (should (eq (plist-get (gethash "s" nelisp-ime-sessions) :detail) 'compact))
+    ;; And the next ordinary snapshot is compact again, which is the thing
+    ;; the caller actually observes.
+    (let ((after (nelisp-ime-feed "s" '(:op :insert :text "はし"))))
+      (should (equal (plist-get after :segments) []))
+      (should (equal (plist-get after :candidates) [])))))
+
+(ert-deftest nelisp-ime-test-selection-leaves-a-full-session-full ()
+  "The restore puts back what was there, not `compact' unconditionally."
+  (nelisp-ime-test--isolated
+    (setq nelisp-ime-dictionary '(("はし" "橋" "箸")))
+    (nelisp-ime-session-open "s" '(:detail full))
+    (nelisp-ime-feed "s" '(:op :insert :text "はし"))
+    (nelisp-ime-feed "s" '(:op :select-candidate :index 0))
+    (should (eq (plist-get (gethash "s" nelisp-ime-sessions) :detail) 'full))
+    (let ((after (nelisp-ime-feed "s" '(:op :insert :text "はし"))))
+      (should-not (equal (plist-get after :candidates) [])))))
+
 (provide 'nelisp-ime-test)
 ;;; nelisp-ime-test.el ends here

@@ -654,6 +654,24 @@ session; omitting it defers to `nelisp-ime-converter-function' and then
     (puthash session-id empty nelisp-ime-sessions)
     (nelisp-ime--snapshot empty commit)))
 
+(defun nelisp-ime--answer-in-full (session-id session body)
+  "Call BODY with SESSION forced to full detail, then restore the detail.
+
+BODY receives the session and returns the snapshot to answer with.  The
+session's own `:detail' is put back afterwards -- read from the sessions
+table rather than from SESSION, because BODY is free to store a different
+plist under SESSION-ID and it is the stored one that must not have been
+upgraded.  A nil detail is restored as nil, which `nelisp-ime--compact-p'
+reads the same way as an absent key."
+  (let ((previous (plist-get session :detail)))
+    (prog1
+        (let ((nelisp-ime-snapshot-detail 'full))
+          (funcall body (plist-put session :detail 'full)))
+      (let ((stored (gethash session-id nelisp-ime-sessions)))
+        (when stored
+          (puthash session-id (plist-put stored :detail previous)
+                   nelisp-ime-sessions))))))
+
 (defun nelisp-ime--dispatch (session-id session event)
   "Apply EVENT to SESSION under SESSION-ID and return a snapshot."
   (let ((engine (nelisp-ime--session-engine session))
@@ -668,17 +686,26 @@ session; omitting it defers to `nelisp-ime-converter-function' and then
        ((eq operation :backspace)
         (nelisp-ime--backspace session-id session))
        ;; A selection answer must carry the list being selected from, so
-       ;; these two ignore a compact session.
+       ;; these two ignore a compact session -- for the answer only.
+       ;; `plist-put' mutates in place when the key is present, and the plist
+       ;; it mutates is the one in `nelisp-ime-sessions', so forcing the
+       ;; detail here used to make the upgrade permanent: a compact session
+       ;; that selected a candidate once carried full segments and candidates
+       ;; on every snapshot afterwards.  That is the same defect the
+       ;; `detail' comment in `nelisp-ime--finish' records for commits, in
+       ;; the one other place that writes the field.
        ((eq operation :select-candidate)
-        (let ((nelisp-ime-snapshot-detail 'full))
-          (nelisp-ime--select-candidate session-id
-                                        (plist-put session :detail 'full)
-                                        (plist-get event :index))))
+        (nelisp-ime--answer-in-full
+         session-id session
+         (lambda (full)
+           (nelisp-ime--select-candidate session-id full
+                                         (plist-get event :index)))))
        ((eq operation :select-segment)
-        (let ((nelisp-ime-snapshot-detail 'full))
-          (nelisp-ime--select-segment session-id
-                                      (plist-put session :detail 'full)
-                                      (plist-get event :index))))
+        (nelisp-ime--answer-in-full
+         session-id session
+         (lambda (full)
+           (nelisp-ime--select-segment session-id full
+                                       (plist-get event :index)))))
        ((eq operation :commit)
         (nelisp-ime--finish session-id session t))
        ((eq operation :cancel)
