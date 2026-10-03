@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Thin IBus adapter for the portable NeLisp Japanese IME engine."""
 
+import sys
+import threading
 import uuid
 
 from nelisp_client import NeLispClient
@@ -10,19 +12,56 @@ gi.require_version("IBus", "1.0")
 from gi.repository import GLib, IBus  # noqa: E402
 
 
+# Keys held per engine while NeLisp starts; matches the native GTK host.
+STARTUP_QUEUE_LIMIT = 64
+
+
 class NeLispEngine(IBus.Engine):
     __gtype_name__ = "NeLispIBusEngine"
     client = None
+    # "starting", "ready" or "failed"; written only on the main loop.
+    client_state = "starting"
+    waiting = []
 
-    def __init__(self, connection, object_path):
-        super().__init__(connection=connection, object_path=object_path)
-        if NeLispEngine.client is None:
-            NeLispEngine.client = NeLispClient()
+    # IBus.Factory constructs engines with g_object_new, so PyGObject calls
+    # __init__ without positional arguments; connection and object path
+    # arrive as construct properties.  NeLisp starts on a worker thread at
+    # process start, so engine creation never waits for it.
+    def __init__(self, **properties):
+        super().__init__(**properties)
         self.session_id = "ibus:" + str(uuid.uuid4())
-        self.client.request("ime/session.open",
-                            {"sessionId": self.session_id, "inputStyle": "romaji"})
         self.snapshot = {"preedit": "", "candidates": [], "candidate-index": 0}
         self.lookup = IBus.LookupTable.new(9, 0, True, True)
+        self.opened = False
+        self.queued = []
+        if NeLispEngine.client_state == "starting":
+            NeLispEngine.waiting.append(self)
+        else:
+            self._client_settled()
+
+    def _client_settled(self):
+        """Open the session and replay queued keys once startup settled."""
+        if NeLispEngine.client_state == "ready":
+            self.client.request("ime/session.open",
+                                {"sessionId": self.session_id, "inputStyle": "romaji"})
+            self.opened = True
+        queued, self.queued = self.queued, []
+        if queued:
+            self.update_preedit_text(IBus.Text.new_from_string(""), 0, False)
+        for keyval, keycode, state in queued:
+            handled = self.opened and self._process(keyval, state)
+            if not handled:
+                self.forward_key_event(keyval, keycode, state)
+
+    def _queue(self, keyval, keycode, state):
+        if len(self.queued) >= STARTUP_QUEUE_LIMIT:
+            print("QUEUE_FULL", file=sys.stderr, flush=True)
+            return True
+        self.queued.append((keyval, keycode, state))
+        raw = "".join(IBus.keyval_to_unicode(k) or "" for k, _, _ in self.queued)
+        raw = "".join(c for c in raw if c.isprintable())
+        self.update_preedit_text(IBus.Text.new_from_string(raw), len(raw), bool(raw))
+        return True
 
     def _feed(self, event):
         self.snapshot = self.client.request(
@@ -36,17 +75,28 @@ class NeLispEngine(IBus.Engine):
         self.lookup.clear()
         for candidate in self.snapshot.get("candidates") or []:
             self.lookup.append_candidate(IBus.Text.new_from_string(candidate))
-        self.lookup.set_cursor_pos(self.snapshot.get("candidate-index", 0))
+        # set_cursor_pos asserts (aborting the engine) when the table is empty.
+        count = self.lookup.get_number_of_candidates()
+        index = self.snapshot.get("candidate-index", 0)
+        if 0 <= index < count:
+            self.lookup.set_cursor_pos(index)
         self.update_lookup_table(self.lookup, self.lookup.get_number_of_candidates() > 1)
         return True
 
     def do_process_key_event(self, keyval, keycode, state):
-        del keycode
         if state & IBus.ModifierType.RELEASE_MASK:
             return False
         if state & (IBus.ModifierType.CONTROL_MASK | IBus.ModifierType.MOD1_MASK |
                     IBus.ModifierType.SUPER_MASK):
             return False
+        if NeLispEngine.client_state == "failed":
+            return False
+        if not self.opened or self.queued:
+            return self._queue(keyval, keycode, state)
+        return self._process(keyval, state)
+
+    def _process(self, keyval, state):
+        del state
         composing = bool(self.snapshot.get("preedit"))
         if keyval == IBus.KEY_BackSpace and composing:
             return self._feed({"op": "backspace"})
@@ -64,8 +114,8 @@ class NeLispEngine(IBus.Engine):
             return self._feed({"op": "select-segment", "index": active - 1})
         if keyval == IBus.KEY_Right and active + 1 < len(segments):
             return self._feed({"op": "select-segment", "index": active + 1})
-        codepoint = IBus.keyval_to_unicode(keyval)
-        key = chr(codepoint) if codepoint else ""
+        # PyGObject maps the gunichar result to a one-character str ("" for none).
+        key = IBus.keyval_to_unicode(keyval) or ""
         if key.isascii() and (key.isalpha() or key == "'"):
             return self._feed({"op": "key", "key": key.lower()})
         if composing and key and key.isprintable():
@@ -80,17 +130,51 @@ class NeLispEngine(IBus.Engine):
         self._feed({"op": "commit"})
 
     def do_reset(self):
-        self._feed({"op": "cancel"})
+        if self.queued:
+            self.queued = []
+            self.update_preedit_text(IBus.Text.new_from_string(""), 0, False)
+        if self.opened:
+            self._feed({"op": "cancel"})
 
     def do_destroy(self):
         try:
-            self.client.request("ime/session.close", {"sessionId": self.session_id})
+            if self in NeLispEngine.waiting:
+                NeLispEngine.waiting.remove(self)
+            if self.opened:
+                self.client.request("ime/session.close", {"sessionId": self.session_id})
         finally:
-            super().do_destroy()
+            IBus.Engine.do_destroy(self)
+
+
+def start_client():
+    """Start NeLisp off the main loop; settle waiting engines on the loop."""
+    def settle(client, error):
+        if client is not None:
+            NeLispEngine.client = client
+            NeLispEngine.client_state = "ready"
+            print("ENGINE_READY", file=sys.stderr, flush=True)
+        else:
+            NeLispEngine.client_state = "failed"
+            print("ENGINE_FAILED: %s" % error, file=sys.stderr, flush=True)
+        waiting, NeLispEngine.waiting = NeLispEngine.waiting, []
+        for engine in waiting:
+            engine._client_settled()
+        return False
+
+    def worker():
+        try:
+            client = NeLispClient()
+        except Exception as error:  # pylint: disable=broad-except
+            GLib.idle_add(settle, None, error)
+        else:
+            GLib.idle_add(settle, client, None)
+
+    threading.Thread(target=worker, name="nelisp-start", daemon=True).start()
 
 
 def main():
     IBus.init()
+    start_client()
     bus = IBus.Bus.new()
     factory = IBus.Factory.new(bus.get_connection())
     factory.add_engine("nelisp-ime", NeLispEngine.__gtype__)

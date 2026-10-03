@@ -1,0 +1,20 @@
+#+TITLE: Verify the NeLisp IME as a registered IBus desktop input method
+
+* S1 Repeatable real IBus desktop harness
+** S1.1 Harness registers the source-tree component with a private ibus-daemon, leaves kanji unconverted when the engine is not selected, and reaps every owned process
+evidence: target/ibus-desktop-validation/suite/control/result.json sha256=a6cb9082f9526ab826251d0a73953ea9cca961b301475db7a1668b042ead0f0e
+** S1.2 The previously committed engine fails the same desktop conversion (TypeError in __init__)
+evidence: target/ibus-desktop-validation/ctl-head.log sha256=b3b1e93af9f77bbe32abf2ad64b49c768e7a58ab21ad726b8285e12941a756e6
+** S1.3 Through ibus-daemon, a GTK4 entry receives the 幹事 commit for kanji, Space, Enter typed by xdotool
+evidence: target/ibus-desktop-validation/suite/convert/result.json sha256=8e93623aa7c6a07894323f98ebfdfef57748dad45b4bcd483e1b445e45ddf102
+
+* S2 Desktop robustness
+#+NOTE: 2026-10-03: S2.2 was added and the README criterion became a cmd, so the denominator is 7 rather than the 6 originally drafted.
+** S2.1 Keys typed while a deliberately slowed NeLisp starts are held and converted to 幹事
+evidence: target/ibus-desktop-validation/suite/early/result.json sha256=b7d2c7cad4ac4175a4482b0073f720ba5e48a884c70e8cdd5c08cfda2619ecad
+** S2.2 An otherwise fixed engine that starts NeLisp synchronously fails the early-typing check
+evidence: target/ibus-desktop-validation/ctl-sync.log sha256=f21f3e53e13d85d34cdc9bf7aae068dfc586b7be404d5639d4801e94e40e3673
+** S2.3 README documents startup queueing and the desktop harness command and prerequisites
+cmd: grep -q 'desktop-check' platform/linux/ibus/README.md && grep -q 'QUEUE_FULL' platform/linux/ibus/README.md && grep -q 'xdotool' platform/linux/ibus/README.md
+** S2.4 Full desktop suite (control, convert, burst, early) passes on the real runtime
+evidence: target/ibus-desktop-validation/suite/summary.json sha256=61312454ff6947a9f881f699e5286925f7009669b40b1d9f3e27405daab4307f
