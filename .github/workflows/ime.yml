@@ -72,10 +72,17 @@ jobs:
           cmake -S platform/linux -B platform/linux/build -DCMAKE_INSTALL_PREFIX=/usr
           cmake --build platform/linux/build --parallel 2
           DESTDIR="$RUNNER_TEMP/nelisp-ime-stage" cmake --install platform/linux/build
+      - name: Run Fcitx 5 recovery fixture
+        run: |
+          cmake -S platform/linux/fcitx5 -B platform/linux/fcitx5/build -DNELISP_IME_BUILD_TESTS=ON
+          cmake --build platform/linux/fcitx5/build --parallel 2
+          ctest --test-dir platform/linux/fcitx5/build --output-on-failure
       - name: Check IBus bridge
         run: make -C platform/linux/ibus check
       - name: Build Linux NeLisp and run protocol integration
         run: make -C platform/common smoke
+      - name: Run common client fault injection
+        run: make -C platform/common fault-smoke
 
   macos:
     runs-on: macos-14
@@ -113,4 +120,5 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           cmake -S platform/common -B platform/common/build-cmake -A x64
           cmake --build platform/common/build-cmake --config Release
+          ctest --test-dir platform/common/build-cmake -C Release --output-on-failure
           platform/common/build-cmake/Release/nelisp-ime-common-smoke.exe target/nelisp.exe $PWD platform/common/build-cmake/learning.json

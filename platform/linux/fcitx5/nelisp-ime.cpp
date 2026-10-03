@@ -10,7 +10,12 @@
 #include <fcitx/instance.h>
 #include <cstdlib>
 #include <memory>
+#include <atomic>
+#include <chrono>
+#include <exception>
+#include <thread>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -66,8 +71,11 @@ public:
   void keyEvent(fcitx::KeyEvent &);
   void reset();
   void select(int);
+  void clearUI() noexcept;
+  bool ensureSession();
+  void discardSession() noexcept;
 private:
-  void apply(const nelisp_ime::Snapshot &);
+  void apply(const nelisp_ime::Snapshot &, bool *commitDelivered = nullptr);
   void updateUI();
   NelispEngine *engine_;
   fcitx::InputContext *context_;
@@ -77,52 +85,152 @@ private:
   int candidateIndex_ = 0;
   int activeSegment_ = 0;
   int segmentCount_ = 0;
+  uint64_t generation_ = 0;
 };
 
 class NelispEngine final : public fcitx::InputMethodEngineV2 {
 public:
   explicit NelispEngine(fcitx::Instance *instance)
       : client_(envOr("NELISP_IME_RUNTIME", "/usr/libexec/nelisp-ime/nelisp"),
-                envOr("NELISP_IME_ROOT", "/usr/share/nelisp-ime/nelisp-root")),
+                envOr("NELISP_IME_ROOT", "/usr/share/nelisp-ime/nelisp-root"),
+                nelisp_ime::Client::TimeoutPolicy{std::chrono::seconds(60),
+                                                  std::chrono::milliseconds(250)}),
         learningFile_(envOr("XDG_DATA_HOME",
                             (envOr("HOME", ".") + "/.local/share").c_str()) +
                       "/nelisp-ime/learning.json"),
         factory_([this](fcitx::InputContext &context) {
           return new NelispState(this, &context);
         }) {
-    client_.start();
-    client_.loadLearning(learningFile_);
     instance->inputContextManager().registerProperty("nelispImeState", &factory_);
+    beginRecovery();
+  }
+  ~NelispEngine() override {
+    shuttingDown_.store(true);
+    if (recoveryThread_.joinable()) recoveryThread_.join();
+    factory_.unregister();
   }
   void keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &event) override {
-    if (!event.isRelease()) event.inputContext()->propertyFor(&factory_)->keyEvent(event);
+    if (event.isRelease()) return;
+    finishRecoveryIfReady();
+    if (recovering_.load()) return;
+    event.inputContext()->propertyFor(&factory_)->keyEvent(event);
   }
   void reset(const fcitx::InputMethodEntry &, fcitx::InputContextEvent &event) override {
-    event.inputContext()->propertyFor(&factory_)->reset();
+    finishRecoveryIfReady();
+    if (!recovering_.load()) event.inputContext()->propertyFor(&factory_)->reset();
   }
   nelisp_ime::Client &client() { return client_; }
-  void saveLearning() { client_.saveLearning(learningFile_); }
+  bool ready() { finishRecoveryIfReady(); return available_ && !recovering_.load(); }
+  uint64_t generation() const { return generation_; }
+  void add(NelispState *state) { states_.insert(state); }
+  void remove(NelispState *state) { states_.erase(state); }
+  void failed(const char *where, const std::exception &error) {
+    FCITX_ERROR() << "NeLisp IME " << where << ": " << error.what();
+    available_ = false;
+    for (auto *state : states_) state->clearUI();
+    beginRecovery();
+  }
+  void protocolFailure(NelispState *state, const std::exception &error) {
+    FCITX_ERROR() << "NeLisp IME protocol: " << error.what();
+    state->discardSession();
+  }
+  bool canCloseSessions() const { return available_ && !recovering_.load(); }
+  void saveLearning() noexcept {
+    try { client_.saveLearning(learningFile_); }
+    catch (const nelisp_ime::TransportError &error) { failed("learning save", error); }
+    catch (const std::exception &error) {
+      FCITX_ERROR() << "NeLisp IME learning save: " << error.what();
+    }
+  }
 private:
+  void beginRecovery() {
+    if (shuttingDown_.load() || recovering_.exchange(true)) return;
+    lastRetry_ = std::chrono::steady_clock::now();
+    recoveryDone_.store(false);
+    recoverySucceeded_.store(false);
+    try {
+      recoveryThread_ = std::thread([this] {
+        bool ok = false;
+        try { client_.start(); client_.loadLearning(learningFile_); ok = true; }
+        catch (const std::exception &error) {
+          FCITX_ERROR() << "NeLisp IME recovery: " << error.what();
+        }
+        recoverySucceeded_.store(ok);
+        recoveryDone_.store(true);
+      });
+    } catch (const std::exception &error) {
+      available_ = false;
+      recoveryDone_.store(false);
+      recoverySucceeded_.store(false);
+      recovering_.store(false);
+      FCITX_ERROR() << "NeLisp IME recovery thread: " << error.what();
+    }
+  }
+  void finishRecoveryIfReady() {
+    if (recovering_.load() && recoveryDone_.load()) {
+      if (recoveryThread_.joinable()) recoveryThread_.join();
+      available_ = recoverySucceeded_.load();
+      if (available_) ++generation_;
+      recovering_.store(false);
+    }
+    if (!available_) {
+      auto now = std::chrono::steady_clock::now();
+      if (now - lastRetry_ >= std::chrono::seconds(3)) beginRecovery();
+    }
+  }
   nelisp_ime::Client client_;
   std::string learningFile_;
   fcitx::FactoryFor<NelispState> factory_;
+  std::unordered_set<NelispState *> states_;
+  std::thread recoveryThread_;
+  std::atomic<bool> recovering_{false}, recoveryDone_{false}, recoverySucceeded_{false}, shuttingDown_{false};
+  bool available_ = false;
+  uint64_t generation_ = 0;
+  std::chrono::steady_clock::time_point lastRetry_ = std::chrono::steady_clock::now();
 };
 
 NelispState::NelispState(NelispEngine *engine, fcitx::InputContext *context)
     : engine_(engine), context_(context),
       sessionId_("fcitx:" + std::to_string(reinterpret_cast<uintptr_t>(context))) {
-  engine_->client().openSession(sessionId_, "romaji");
+  engine_->add(this);
 }
 NelispState::~NelispState() {
-  try { engine_->client().closeSession(sessionId_); } catch (...) {}
+  engine_->remove(this);
+  if (engine_->canCloseSessions() && generation_ == engine_->generation()) {
+    try { engine_->client().closeSession(sessionId_); } catch (...) {}
+  }
 }
-void NelispState::apply(const nelisp_ime::Snapshot &snapshot) {
+bool NelispState::ensureSession() {
+  if (!engine_->ready()) return false;
+  if (generation_ != engine_->generation()) {
+    engine_->client().openSession(sessionId_, "romaji");
+    generation_ = engine_->generation();
+    preedit_.clear(); candidates_.clear(); candidateIndex_ = 0;
+  }
+  return true;
+}
+void NelispState::clearUI() noexcept {
+  preedit_.clear(); candidates_.clear(); candidateIndex_ = 0;
+  activeSegment_ = 0; segmentCount_ = 0; generation_ = 0;
+  try { updateUI(); } catch (...) {}
+}
+void NelispState::discardSession() noexcept {
+  clearUI();
+  if (!engine_->canCloseSessions()) return;
+  try { engine_->client().closeSession(sessionId_); }
+  catch (const nelisp_ime::TransportError &error) { engine_->failed("session close", error); }
+  catch (const std::exception &error) {
+    FCITX_ERROR() << "NeLisp IME session close: " << error.what();
+  }
+}
+void NelispState::apply(const nelisp_ime::Snapshot &snapshot, bool *commitDelivered) {
   preedit_ = snapshot.preedit;
   candidates_ = snapshot.candidates;
   candidateIndex_ = snapshot.candidateIndex;
   activeSegment_ = snapshot.activeSegment;
   segmentCount_ = snapshot.segmentCount;
   if (!snapshot.commit.empty()) {
+    if (commitDelivered) *commitDelivered = true;
     context_->commitString(snapshot.commit);
     engine_->saveLearning();
   }
@@ -143,56 +251,72 @@ void NelispState::updateUI() {
   context_->updatePreedit();
 }
 void NelispState::select(int index) {
-  apply(engine_->client().feedOperation(sessionId_, "select-candidate", index));
-  apply(engine_->client().feedOperation(sessionId_, "commit"));
+  try {
+    if (!ensureSession()) return;
+    apply(engine_->client().feedOperation(sessionId_, "select-candidate", index));
+    apply(engine_->client().feedOperation(sessionId_, "commit"));
+  } catch (const nelisp_ime::TransportError &error) { engine_->failed("candidate selection", error); }
+    catch (const std::exception &error) { engine_->protocolFailure(this, error); }
 }
 void NelispState::reset() {
-  apply(engine_->client().feedOperation(sessionId_, "cancel"));
+  try {
+    if (!ensureSession()) { clearUI(); return; }
+    apply(engine_->client().feedOperation(sessionId_, "cancel"));
+  } catch (const nelisp_ime::TransportError &error) { engine_->failed("reset", error); }
+    catch (const std::exception &error) { engine_->protocolFailure(this, error); }
 }
 void NelispState::keyEvent(fcitx::KeyEvent &event) {
   if (event.key().states()) return;
+  bool commitDelivered = false;
   try {
+    if (!ensureSession()) { clearUI(); return; }
     if (event.key().check(FcitxKey_BackSpace)) {
       if (preedit_.empty()) return;
-      apply(engine_->client().feedOperation(sessionId_, "backspace"));
+      apply(engine_->client().feedOperation(sessionId_, "backspace"), &commitDelivered);
       return event.filterAndAccept();
     }
     if (event.key().check(FcitxKey_Escape)) {
       if (preedit_.empty()) return;
-      reset(); return event.filterAndAccept();
+      apply(engine_->client().feedOperation(sessionId_, "cancel"), &commitDelivered);
+      return event.filterAndAccept();
     }
     if (event.key().check(FcitxKey_Return)) {
       if (preedit_.empty()) return;
-      apply(engine_->client().feedOperation(sessionId_, "commit"));
+      apply(engine_->client().feedOperation(sessionId_, "commit"), &commitDelivered);
       return event.filterAndAccept();
     }
     if (event.key().check(FcitxKey_space) && !candidates_.empty()) {
       candidateIndex_ = (candidateIndex_ + 1) % static_cast<int>(candidates_.size());
-      apply(engine_->client().feedOperation(sessionId_, "select-candidate", candidateIndex_));
+      apply(engine_->client().feedOperation(sessionId_, "select-candidate", candidateIndex_), &commitDelivered);
       return event.filterAndAccept();
     }
     if (event.key().check(FcitxKey_Left) && activeSegment_ > 0) {
-      apply(engine_->client().feedOperation(sessionId_, "select-segment", activeSegment_ - 1));
+      apply(engine_->client().feedOperation(sessionId_, "select-segment", activeSegment_ - 1), &commitDelivered);
       return event.filterAndAccept();
     }
     if (event.key().check(FcitxKey_Right) && activeSegment_ + 1 < segmentCount_) {
-      apply(engine_->client().feedOperation(sessionId_, "select-segment", activeSegment_ + 1));
+      apply(engine_->client().feedOperation(sessionId_, "select-segment", activeSegment_ + 1), &commitDelivered);
       return event.filterAndAccept();
     }
     uint32_t cp = fcitx::Key::keySymToUnicode(event.key().sym());
     if (!((cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') || cp == '\'')) {
       if (!preedit_.empty() && cp) {
-        apply(engine_->client().feedOperation(sessionId_, "commit"));
+        apply(engine_->client().feedOperation(sessionId_, "commit"), &commitDelivered);
         context_->commitString(fcitx::utf8::UCS4ToUTF8(cp));
         return event.filterAndAccept();
       }
       if (!preedit_.empty()) return event.filterAndAccept();
       return;
     }
-    apply(engine_->client().feedKey(sessionId_, fcitx::utf8::UCS4ToUTF8(cp)));
+    apply(engine_->client().feedKey(sessionId_, fcitx::utf8::UCS4ToUTF8(cp)), &commitDelivered);
     event.filterAndAccept();
+  } catch (const nelisp_ime::TransportError &error) {
+    engine_->failed("key event", error);
+    if (commitDelivered) event.filterAndAccept();
   } catch (const std::exception &error) {
-    FCITX_ERROR() << "NeLisp IME: " << error.what();
+    FCITX_ERROR() << "NeLisp IME key event: " << error.what();
+    engine_->protocolFailure(this, error);
+    if (commitDelivered) event.filterAndAccept();
   }
 }
 

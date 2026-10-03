@@ -1,13 +1,16 @@
 #include "nelisp_ime_client.hpp"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -18,6 +21,8 @@
 #include <csignal>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <poll.h>
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -234,31 +239,57 @@ Snapshot snapshotFromJson(const std::string &json) {
 class Client::Process {
 public:
   ~Process() { stop(); }
+  void invalidate() { stop(); }
   void start(const std::string &runtime) {
+    stop();
 #ifdef _WIN32
+    const std::wstring wideRuntime = windowsWide(runtime);
+    std::wstring command = L"\"" + wideRuntime +
+                           L"\" --repl --no-prompt --no-print";
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
     HANDLE childInRead = nullptr, childOutWrite = nullptr;
-    if (!CreatePipe(&childOutRead_, &childOutWrite, &sa, 0) ||
-        !SetHandleInformation(childOutRead_, HANDLE_FLAG_INHERIT, 0) ||
-        !CreatePipe(&childInRead, &childInWrite_, &sa, 0) ||
-        !SetHandleInformation(childInWrite_, HANDLE_FLAG_INHERIT, 0))
+    if (!CreatePipe(&childOutRead_, &childOutWrite, &sa, 0)) {
+      if (childOutRead_) CloseHandle(childOutRead_);
+      if (childOutWrite) CloseHandle(childOutWrite);
+      childOutRead_ = nullptr;
       throw std::runtime_error("CreatePipe failed");
+    }
+    if (!SetHandleInformation(childOutRead_, HANDLE_FLAG_INHERIT, 0) ||
+        !CreatePipe(&childInRead, &childInWrite_, &sa, 0) ||
+        !SetHandleInformation(childInWrite_, HANDLE_FLAG_INHERIT, 0)) {
+      if (childInRead) CloseHandle(childInRead);
+      if (childInWrite_) CloseHandle(childInWrite_);
+      if (childOutRead_) CloseHandle(childOutRead_);
+      if (childOutWrite) CloseHandle(childOutWrite);
+      childInWrite_ = childOutRead_ = nullptr;
+      throw std::runtime_error("CreatePipe setup failed");
+    }
     STARTUPINFOW si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = childInRead; si.hStdOutput = childOutWrite;
     si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     PROCESS_INFORMATION pi{};
-    std::wstring command = L"\"" + windowsWide(runtime) +
-                           L"\" --repl --no-prompt --no-print";
     if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
                         CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+      CloseHandle(childInRead); CloseHandle(childOutWrite);
+      CloseHandle(childInWrite_); CloseHandle(childOutRead_);
+      childInWrite_ = childOutRead_ = nullptr;
       throw std::runtime_error("CreateProcess failed");
+    }
     CloseHandle(childInRead); CloseHandle(childOutWrite); CloseHandle(pi.hThread);
     process_ = pi.hProcess;
 #else
     int input[2], output[2];
-    if (pipe(input) || pipe(output)) throw std::runtime_error("pipe failed");
+    if (pipe(input)) throw std::runtime_error("pipe failed");
+    if (pipe(output)) {
+      close(input[0]); close(input[1]);
+      throw std::runtime_error("pipe failed");
+    }
     pid_ = fork();
-    if (pid_ < 0) throw std::runtime_error("fork failed");
+    if (pid_ < 0) {
+      close(input[0]); close(input[1]); close(output[0]); close(output[1]);
+      throw std::runtime_error("fork failed");
+    }
     if (pid_ == 0) {
       dup2(input[0], STDIN_FILENO); dup2(output[1], STDOUT_FILENO);
       close(input[0]); close(input[1]); close(output[0]); close(output[1]);
@@ -276,28 +307,77 @@ public:
       DWORD written = 0;
       if (!WriteFile(childInWrite_, data.data() + done,
                      static_cast<DWORD>(data.size() - done), &written, nullptr))
-        throw std::runtime_error("write to NeLisp failed");
+        throw TransportError("write to NeLisp failed");
 #else
+      sigset_t pipeSignal, previous;
+      sigemptyset(&pipeSignal);
+      sigaddset(&pipeSignal, SIGPIPE);
+      bool wasPending = false;
+      sigset_t pending;
+      if (pthread_sigmask(SIG_BLOCK, &pipeSignal, &previous) != 0)
+        throw TransportError("could not block SIGPIPE");
+      if (sigpending(&pending) == 0) wasPending = sigismember(&pending, SIGPIPE) == 1;
       ssize_t written = ::write(input_, data.data() + done, data.size() - done);
+      int writeError = errno;
+      if (written < 0 && writeError == EPIPE && !wasPending) {
+        timespec zero{};
+        while (sigtimedwait(&pipeSignal, nullptr, &zero) < 0 && errno == EINTR) {}
+      }
+      pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+      errno = writeError;
       if (written < 0 && errno == EINTR) continue;
-      if (written <= 0) throw std::runtime_error("write to NeLisp failed");
+      if (written <= 0) throw TransportError("write to NeLisp failed");
 #endif
       done += static_cast<size_t>(written);
     }
   }
-  std::string readLine() {
-    std::string line; char c;
+  std::string readLine(std::chrono::milliseconds timeout) {
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + timeout;
+    std::string line;
     while (true) {
 #ifdef _WIN32
+      if (Clock::now() >= deadline) throw TransportError("NeLisp response timeout");
+      DWORD available = 0;
+      if (!PeekNamedPipe(childOutRead_, nullptr, 0, nullptr, &available, nullptr))
+        throw TransportError("read from NeLisp pipe failed");
+      if (available == 0) {
+        if (WaitForSingleObject(process_, 0) == WAIT_OBJECT_0)
+          throw TransportError("NeLisp exited");
+        if (Clock::now() >= deadline) throw TransportError("NeLisp response timeout");
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        continue;
+      }
+      char c;
       DWORD count = 0;
       if (!ReadFile(childOutRead_, &c, 1, &count, nullptr) || count == 0)
-        throw std::runtime_error("NeLisp exited");
+        throw TransportError("NeLisp exited");
 #else
+      const auto now = Clock::now();
+      if (now >= deadline) throw TransportError("NeLisp response timeout");
+      auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+      auto waitCount = remaining.count();
+      int waitMs = waitCount > std::numeric_limits<int>::max()
+          ? std::numeric_limits<int>::max() : static_cast<int>(waitCount);
+      if (waitMs < 1) waitMs = 1;
+      struct pollfd descriptor{output_, POLLIN | POLLHUP | POLLERR, 0};
+      int ready = poll(&descriptor, 1, waitMs);
+      if (ready < 0 && errno == EINTR) continue;
+      if (ready < 0) throw TransportError("poll from NeLisp failed");
+      if (ready == 0) continue;
+      int childStatus = 0;
+      char c;
       ssize_t count = ::read(output_, &c, 1);
       if (count < 0 && errno == EINTR) continue;
-      if (count <= 0) throw std::runtime_error("NeLisp exited");
+      if (count <= 0) {
+        if (pid_ > 0 && waitpid(pid_, &childStatus, WNOHANG) == pid_) pid_ = -1;
+        throw TransportError("NeLisp exited");
+      }
 #endif
-      if (c == '\n') return line;
+      if (c == '\n') {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        return line;
+      }
       line += c;
     }
   }
@@ -307,9 +387,9 @@ private:
     if (childInWrite_) CloseHandle(childInWrite_);
     if (childOutRead_) CloseHandle(childOutRead_);
     if (process_) {
-      if (WaitForSingleObject(process_, 1000) == WAIT_TIMEOUT) {
+      if (WaitForSingleObject(process_, 100) == WAIT_TIMEOUT) {
         TerminateProcess(process_, 0);
-        WaitForSingleObject(process_, 1000);
+        WaitForSingleObject(process_, 100);
       }
       CloseHandle(process_);
     }
@@ -317,7 +397,20 @@ private:
 #else
     if (input_ >= 0) close(input_);
     if (output_ >= 0) close(output_);
-    if (pid_ > 0) { kill(pid_, SIGTERM); waitpid(pid_, nullptr, 0); }
+    if (pid_ > 0) {
+      kill(pid_, SIGTERM);
+      auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+      int status = 0;
+      while (std::chrono::steady_clock::now() < until) {
+        pid_t result = waitpid(pid_, &status, WNOHANG);
+        if (result == pid_ || (result < 0 && errno == ECHILD)) { pid_ = -1; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      if (pid_ > 0) {
+        kill(pid_, SIGKILL);
+        while (waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
+      }
+    }
     input_ = output_ = -1; pid_ = -1;
 #endif
   }
@@ -329,34 +422,51 @@ private:
 };
 
 Client::Client(std::string runtime, std::string resourceRoot)
+    : Client(std::move(runtime), std::move(resourceRoot), TimeoutPolicy{}) {}
+
+Client::Client(std::string runtime, std::string resourceRoot, TimeoutPolicy timeouts)
     : process_(std::make_unique<Process>()), runtime_(std::move(runtime)),
-      root_(std::move(resourceRoot)) {}
+      root_(std::move(resourceRoot)), timeouts_(timeouts) {
+  if (timeouts_.startup.count() <= 0 || timeouts_.response.count() <= 0)
+    throw std::invalid_argument("IME IPC timeouts must be positive");
+}
 Client::~Client() = default;
 
 void Client::start() {
-  process_->start(runtime_);
-  const std::vector<std::string> files = {
-      "packages/nelisp-json/src/nelisp-json.el",
-      "packages/nelisp-ime/src/nelisp-ime-input.el",
-      "packages/nelisp-ime/src/nelisp-ime.el",
-      "packages/nelisp-ime-lattice/src/nelisp-ime-lattice.el",
-      "packages/nelisp-ime-lattice/data/nelisp-ime-dictionary-data.el",
-      "packages/nelisp-ime/src/nelisp-ime-protocol.el"};
-  std::string form = "(progn ";
-  for (const auto &file : files) form += "(load " + lispQuote(root_ + "/" + file) + ") ";
-  form += "(princ \"ready\\n\"))";
-  process_->writeLine(form);
-  if (process_->readLine() != "ready") throw std::runtime_error("NeLisp bootstrap failed");
-  request("ime/initialize", "{\"protocolVersion\":1}");
+  requestId_ = 1;
+  try {
+    process_->start(runtime_);
+    const std::vector<std::string> files = {
+        "packages/nelisp-json/src/nelisp-json.el",
+        "packages/nelisp-ime/src/nelisp-ime-input.el",
+        "packages/nelisp-ime/src/nelisp-ime.el",
+        "packages/nelisp-ime-lattice/src/nelisp-ime-lattice.el",
+        "packages/nelisp-ime-lattice/data/nelisp-ime-dictionary-data.el",
+        "packages/nelisp-ime/src/nelisp-ime-protocol.el"};
+    std::string form = "(progn ";
+    for (const auto &file : files)
+      form += "(load " + lispQuote(root_ + "/" + file) + ") ";
+    form += "(princ \"ready\\n\"))";
+    process_->writeLine(form);
+    std::string ready = process_->readLine(timeouts_.startup);
+    if (ready != "ready")
+      throw std::runtime_error("NeLisp bootstrap failed: " + ready);
+    request("ime/initialize", "{\"protocolVersion\":1}");
+  } catch (const TransportError &) { process_->invalidate(); throw; }
+    catch (...) { process_->invalidate(); throw; }
 }
 
 std::string Client::request(const std::string &method, const std::string &params) {
   std::string json = "{\"jsonrpc\":\"2.0\",\"id\":" +
       std::to_string(requestId_++) + ",\"method\":" + jsonQuote(method) +
       ",\"params\":" + params + "}";
-  process_->writeLine("(princ (concat (nelisp-ime-protocol-handle-json " +
-                      lispQuote(json) + ") \"\\n\"))");
-  std::string response = process_->readLine();
+  std::string response;
+  try {
+    process_->writeLine("(princ (concat (nelisp-ime-protocol-handle-json " +
+                        lispQuote(json) + ") \"\\n\"))");
+    response = process_->readLine(timeouts_.response);
+  } catch (const TransportError &) { process_->invalidate(); throw; }
+    catch (...) { process_->invalidate(); throw; }
   if (valueAt(response, "error") != std::string::npos)
     throw std::runtime_error("NeLisp IME error: " + stringField(response, "message"));
   return response;

@@ -182,6 +182,20 @@ The repository also contains a dedicated four-job GitHub Actions workflow for
 the core, macOS InputMethodKit, Linux Fcitx 5/IBus, and Windows common-client
 builds.
 
+To rebuild against an updated sibling =../nelisp= checkout, run the following
+from this repository in PowerShell:
+
+#+begin_src powershell
+.\tools\build-ime-runtime.ps1
+#+end_src
+
+The helper loads host Elisp sources directly, preserves existing =.elc= files,
+and writes the reader and its caches under =target/ime-runtime-build/=. Use
+=target/ime-runtime-build/nelisp.exe= as the runtime argument for the common
+client smoke above. =report.json= records the runtime revision, build and
+evaluation results, timings, and hashes. =-Emacs=, =-RuntimeRoot=, and
+=-OutputDirectory= override the discovered defaults.
+
 * References
 
 - GNU Emacs =quail= and =kkc.el=

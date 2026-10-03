@@ -1,10 +1,17 @@
 #pragma once
 
 #include <memory>
+#include <chrono>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace nelisp_ime {
+
+class TransportError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 
 struct Snapshot {
   bool consumed = false;
@@ -19,7 +26,15 @@ struct Snapshot {
 
 class Client {
 public:
+  struct TimeoutPolicy {
+    // Deadlines cover the complete protocol line; timeout or transport failure
+    // invalidates and reaps the child. Call start() to create a fresh engine,
+    // then reopen any sessions owned by the caller.
+    std::chrono::milliseconds startup{60000};
+    std::chrono::milliseconds response{10000};
+  };
   Client(std::string runtime, std::string resourceRoot);
+  Client(std::string runtime, std::string resourceRoot, TimeoutPolicy timeouts);
   ~Client();
   Client(const Client &) = delete;
   Client &operator=(const Client &) = delete;
@@ -48,6 +63,7 @@ private:
   std::unique_ptr<Process> process_;
   std::string runtime_;
   std::string root_;
+  TimeoutPolicy timeouts_;
   int requestId_ = 1;
   std::string request(const std::string &method, const std::string &params);
 };
