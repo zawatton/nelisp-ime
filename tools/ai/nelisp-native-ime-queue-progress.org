@@ -1,0 +1,18 @@
+#+TITLE: Queue continuous input in the native NeLisp GTK IME
+
+* S1 Ordered queued input
+** S1.1 Native source passes the AOT structure guard with the queue functions
+cmd: emacs -Q --batch -l platform/linux/nelisp-native-ime/check-aot-structure.el -- platform/linux/nelisp-native-ime/native-ime.el
+** S1.2 Burst-typed kanji, Space and Enter commit 幹事 through the real engine
+evidence: target/native-ime-queue-validation/burst/result.json sha256=4a0bc17f449fdf448338e1c6216ae18b4a75be9e6c15ac8f54a8e7c7cd65e9bc
+** S1.3 The pre-queue binary fails the same burst check
+#+NOTE: The pre-queue binary rebuilt from the snapshot has SHA-256 92b465a6..., matching the recorded native-ime evidence; only PREEDIT: k reached the engine.
+evidence: target/native-ime-queue-validation/burst-prequeue.log sha256=1e48a5b98753ffdf13ba119b75390398c1b5706fea9da000ddbfe531f6a28b2a
+
+* S2 Bounds and regression
+** S2.1 A slow engine fills the 64-key queue, reports QUEUE_FULL and processes exactly the accepted keys
+evidence: target/native-ime-queue-validation/queue-overflow/result.json sha256=2bf154aa9e14a294269f9267d82b74616b77366c08717d7dcaf7ed3f175342eb
+** S2.2 README documents queue order, capacity, overflow and pass-through rules
+cmd: grep -q 'QUEUE_FULL' platform/linux/nelisp-native-ime/README.md && grep -q '64' platform/linux/nelisp-native-ime/README.md
+** S2.3 The full repeatable suite, including burst and overflow modes, passes on the real runtime
+evidence: target/native-ime-queue-validation/suite/summary.json sha256=eeb59077e74f1fa3fa786b63a3522b617509dab12fc39626a3e2a0b5b10528ef

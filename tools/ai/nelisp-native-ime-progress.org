@@ -1,0 +1,17 @@
+#+TITLE: Connect the native NeLisp GTK probe to the existing IME engine
+
+* S1 Real conversion path
+** S1.1 NeLisp native callbacks exchange versioned requests with the existing engine
+cmd: test -f target/native-ime-validation/final/positive/result.json && grep -q '"status": "PASS"' target/native-ime-validation/final/positive/result.json
+** S1.2 Real key events display engine-produced kana and conversion candidates
+evidence: target/native-ime-validation/final/positive/candidates.png sha256=b6ffd0b18a9491b475e0fee6ed7bd24c1e19becf726bffecffa0667e93456de0
+** S1.3 Actual GTK input converts and commits Japanese through the real NeLisp engine
+evidence: target/native-ime-validation/final/positive/result.json sha256=f1bd3f06e22c61b59905ecbecabdd197d7b6a6a4c70f089ed027f24f63fc9faa
+
+* S2 Reliability and repeatable verification
+** S2.1 Engine startup and responses are bounded without freezing GTK
+evidence: target/native-ime-validation/final/reliability.json sha256=028f804c5d54a4c6552f2d4173c3971a8b341828230a8775a78a04e31b03c396
+** S2.2 Engine failure and disabled-conversion controls are detected by the verifier
+evidence: target/native-ime-validation/final/controls.json sha256=fab167fd8da92fdd39cddb4d3ef5071cb211d76631935a08079aa5dafe1c2c93
+** S2.3 Integrated real-engine conversion, commit, next input and owned-process cleanup pass
+evidence: target/native-ime-validation/final/summary.json sha256=ac20b65915259487ef93d709a5486f8e5f93358051dd6b268a461d538ad1a1b9
