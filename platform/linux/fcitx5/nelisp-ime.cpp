@@ -1,4 +1,5 @@
 #include "nelisp_ime_client.hpp"
+#include <fcitx-utils/eventdispatcher.h>
 #include <fcitx-utils/utf8.h>
 #include <fcitx/addonfactory.h>
 #include <fcitx/addonmanager.h>
@@ -74,7 +75,16 @@ public:
   void clearUI() noexcept;
   bool ensureSession();
   void discardSession() noexcept;
+  // Startup/recovery key queue: keys are held while NeLisp starts, then
+  // replayed in order; unconsumed or unreplayable keys are forwarded.
+  void queueKey(const fcitx::Key &key);
+  void replayQueued();
+  void forwardQueued() noexcept;
+  void dropQueued() noexcept;
+  bool hasQueued() const { return !queued_.empty(); }
 private:
+  void showQueued();
+  std::vector<fcitx::Key> queued_;
   void apply(const nelisp_ime::Snapshot &, bool *commitDelivered = nullptr);
   void updateUI();
   NelispEngine *engine_;
@@ -91,7 +101,7 @@ private:
 class NelispEngine final : public fcitx::InputMethodEngineV2 {
 public:
   explicit NelispEngine(fcitx::Instance *instance)
-      : client_(envOr("NELISP_IME_RUNTIME", "/usr/libexec/nelisp-ime/nelisp"),
+      : instance_(instance), client_(envOr("NELISP_IME_RUNTIME", "/usr/libexec/nelisp-ime/nelisp"),
                 envOr("NELISP_IME_ROOT", "/usr/share/nelisp-ime/nelisp-root"),
                 nelisp_ime::Client::TimeoutPolicy{std::chrono::seconds(60),
                                                   std::chrono::milliseconds(250)}),
@@ -107,18 +117,32 @@ public:
   ~NelispEngine() override {
     shuttingDown_.store(true);
     if (recoveryThread_.joinable()) recoveryThread_.join();
+    alive_.reset();
     factory_.unregister();
   }
   void keyEvent(const fcitx::InputMethodEntry &, fcitx::KeyEvent &event) override {
     if (event.isRelease()) return;
     finishRecoveryIfReady();
-    if (recovering_.load()) return;
-    event.inputContext()->propertyFor(&factory_)->keyEvent(event);
+    auto *state = event.inputContext()->propertyFor(&factory_);
+    if (recovering_.load()) {
+      if (event.key().states()) return;
+      state->queueKey(event.key());
+      return event.filterAndAccept();
+    }
+    state->keyEvent(event);
   }
   void reset(const fcitx::InputMethodEntry &, fcitx::InputContextEvent &event) override {
     finishRecoveryIfReady();
-    if (!recovering_.load()) event.inputContext()->propertyFor(&factory_)->reset();
+    auto *state = event.inputContext()->propertyFor(&factory_);
+    if (recovering_.load()) state->dropQueued();
+    else state->reset();
   }
+  void deactivate(const fcitx::InputMethodEntry &entry,
+                  fcitx::InputContextEvent &event) override {
+    event.inputContext()->propertyFor(&factory_)->forwardQueued();
+    fcitx::InputMethodEngineV2::deactivate(entry, event);
+  }
+  bool recovering() const { return recovering_.load(); }
   nelisp_ime::Client &client() { return client_; }
   bool ready() { finishRecoveryIfReady(); return available_ && !recovering_.load(); }
   uint64_t generation() const { return generation_; }
@@ -157,6 +181,11 @@ private:
         }
         recoverySucceeded_.store(ok);
         recoveryDone_.store(true);
+        // Settle held keys even when no further key arrives.
+        instance_->eventDispatcher().schedule(
+            [this, alive = std::weak_ptr<int>(alive_)] {
+              if (alive.lock()) finishRecoveryIfReady();
+            });
       });
     } catch (const std::exception &error) {
       available_ = false;
@@ -172,12 +201,20 @@ private:
       available_ = recoverySucceeded_.load();
       if (available_) ++generation_;
       recovering_.store(false);
+      std::vector<NelispState *> states(states_.begin(), states_.end());
+      for (auto *state : states) {
+        if (!states_.count(state) || !state->hasQueued()) continue;
+        if (available_) state->replayQueued();
+        else state->forwardQueued();
+      }
     }
     if (!available_) {
       auto now = std::chrono::steady_clock::now();
       if (now - lastRetry_ >= std::chrono::seconds(3)) beginRecovery();
     }
   }
+  fcitx::Instance *instance_;
+  std::shared_ptr<int> alive_ = std::make_shared<int>(0);
   nelisp_ime::Client client_;
   std::string learningFile_;
   fcitx::FactoryFor<NelispState> factory_;
@@ -264,6 +301,61 @@ void NelispState::reset() {
     apply(engine_->client().feedOperation(sessionId_, "cancel"));
   } catch (const nelisp_ime::TransportError &error) { engine_->failed("reset", error); }
     catch (const std::exception &error) { engine_->protocolFailure(this, error); }
+}
+void NelispState::queueKey(const fcitx::Key &key) {
+  static constexpr size_t limit = 64;
+  if (queued_.size() >= limit) {
+    FCITX_WARN() << "NeLisp IME QUEUE_FULL";
+    return;
+  }
+  queued_.push_back(key);
+  showQueued();
+}
+void NelispState::showQueued() {
+  std::string raw;
+  for (const auto &key : queued_) {
+    uint32_t cp = fcitx::Key::keySymToUnicode(key.sym());
+    if (cp >= 0x20 && cp != 0x7f) raw += fcitx::utf8::UCS4ToUTF8(cp);
+  }
+  auto &panel = context_->inputPanel();
+  panel.reset();
+  if (!raw.empty()) {
+    fcitx::Text text(raw, fcitx::TextFormatFlag::Underline);
+    if (context_->capabilityFlags().test(fcitx::CapabilityFlag::Preedit))
+      panel.setClientPreedit(text);
+    else panel.setPreedit(text);
+  }
+  context_->updateUserInterface(fcitx::UserInterfaceComponent::InputPanel);
+  context_->updatePreedit();
+}
+void NelispState::replayQueued() {
+  auto keys = std::move(queued_);
+  queued_.clear();
+  try { updateUI(); } catch (...) {}
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (engine_->recovering()) {
+      // A replayed key broke the transport again: hold the rest.
+      queued_.assign(keys.begin() + static_cast<std::ptrdiff_t>(i), keys.end());
+      showQueued();
+      return;
+    }
+    fcitx::KeyEvent event(context_, keys[i]);
+    keyEvent(event);
+    if (!event.filtered()) context_->forwardKey(keys[i]);
+  }
+}
+void NelispState::forwardQueued() noexcept {
+  auto keys = std::move(queued_);
+  queued_.clear();
+  try {
+    updateUI();
+    for (const auto &key : keys) context_->forwardKey(key);
+  } catch (...) {}
+}
+void NelispState::dropQueued() noexcept {
+  if (queued_.empty()) return;
+  queued_.clear();
+  try { updateUI(); } catch (...) {}
 }
 void NelispState::keyEvent(fcitx::KeyEvent &event) {
   if (event.key().states()) return;

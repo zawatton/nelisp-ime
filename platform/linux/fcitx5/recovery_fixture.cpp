@@ -23,10 +23,13 @@ public:
   const char *frontend() const override { return "fixture"; }
   void commitStringImpl(const std::string &text) override { committed += text; }
   void deleteSurroundingTextImpl(int, unsigned int) override {}
-  void forwardKeyImpl(const fcitx::ForwardKeyEvent &) override {}
+  void forwardKeyImpl(const fcitx::ForwardKeyEvent &event) override {
+    forwarded.push_back(event.rawKey().sym());
+  }
   void updatePreeditImpl() override { ++updates; }
   std::string committed;
   unsigned updates = 0;
+  std::vector<fcitx::KeySym> forwarded;
 };
 
 static void require(bool condition, const char *message) {
@@ -106,13 +109,15 @@ int main(int argc, char **argv) {
       FixtureContext unavailable(instance.inputContextManager());
       auto initial = key(unavailable, FcitxKey_a);
       offline.keyEvent(entry, initial);
-      require(!initial.filtered() && !initial.accepted(),
-              "unavailable initial runtime consumed application input");
       const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
       while (std::chrono::steady_clock::now() < deadline) {
         require(!offline.ready(), "missing runtime unexpectedly became ready");
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
+      // A key held during the failed start must reach the application once.
+      require(unavailable.forwarded.size() == (initial.filtered() ? 1u : 0u),
+              "key held during a failed start was lost or forwarded twice");
+      require(!hasPreedit(unavailable), "failed start left held-key preedit");
       std::filesystem::create_symlink(std::filesystem::absolute(argv[1]), missingRuntime);
       require(waitReady(offline), "same engine did not retry after initial startup failure");
       auto recovered = key(unavailable, FcitxKey_a);
@@ -122,6 +127,32 @@ int main(int argc, char **argv) {
     }
     std::filesystem::remove(logFile);
     setEnv("NELISP_IME_RUNTIME", argv[1]);
+    {
+      setMode(modeFile, "slow-boot");
+      NelispEngine slow(&instance);
+      FixtureContext held(instance.inputContextManager());
+      auto enter = key(held, FcitxKey_Return); slow.keyEvent(entry, enter);
+      auto qa = key(held, FcitxKey_a); slow.keyEvent(entry, qa);
+      auto qb = key(held, FcitxKey_b); slow.keyEvent(entry, qb);
+      require(enter.filtered() && qa.filtered() && qb.filtered(),
+              "keys typed during startup were not held");
+      require(hasPreedit(held) && held.forwarded.empty(),
+              "held keys were not shown or were forwarded early");
+      setMode(modeFile, "normal");
+      require(waitReady(slow), "slow fixture runtime did not bootstrap");
+      require(held.forwarded.size() == 1 && held.forwarded[0] == FcitxKey_Return,
+              "unconsumed held key was not forwarded exactly once");
+      require(hasPreedit(held) && hasCandidates(held),
+              "replayed keys did not produce engine preedit");
+      std::ifstream heldLog(logFile);
+      const std::string text((std::istreambuf_iterator<char>(heldLog)), {});
+      const auto at = text.find("\\\"key\\\":\\\"a\\\""),
+                 bt = text.find("\\\"key\\\":\\\"b\\\"");
+      require(at != std::string::npos && bt != std::string::npos && at < bt &&
+              occurrences(text, "\\\"key\\\":\\\"a\\\"") == 1,
+              "held keys were not replayed exactly once in order");
+    }
+    std::filesystem::remove(logFile);
     NelispEngine engine(&instance);
     FixtureContext first(instance.inputContextManager()), second(instance.inputContextManager());
     require(waitReady(engine), "fixture runtime did not bootstrap");

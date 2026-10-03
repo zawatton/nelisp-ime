@@ -65,7 +65,7 @@ jobs:
         with:
           version: '30.1'
       - name: Install adapter SDKs
-        run: sudo apt-get update && sudo apt-get install -y g++ cmake libfcitx5core-dev libibus-1.0-dev libxml2-utils ibus xvfb xdotool dbus python3-gi gir1.2-ibus-1.0 gir1.2-gtk-4.0
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake libfcitx5core-dev libibus-1.0-dev libxml2-utils ibus xvfb xdotool dbus python3-gi gir1.2-ibus-1.0 gir1.2-gtk-4.0 fcitx5 fcitx5-frontend-gtk4
       - name: Build Fcitx 5 addon
         run: |
           make standalone-reader
@@ -81,6 +81,11 @@ jobs:
         run: make -C platform/linux/ibus check
       - name: Run IBus desktop conversion through a private ibus-daemon
         run: make -C platform/linux/ibus desktop-check
+      - name: Run Fcitx 5 desktop conversion through a private fcitx5
+        run: |
+          NELISP_IME_RUNTIME="$PWD/target/nelisp" NELISP_IME_ROOT="$PWD" \
+            python3 platform/linux/fcitx5/verify-desktop-suite.py \
+            platform/linux/fcitx5/build platform/linux/fcitx5/build/desktop
       - name: Build Linux NeLisp and run protocol integration
         run: make -C platform/common smoke
       - name: Run common client fault injection

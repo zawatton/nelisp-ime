@@ -1,0 +1,26 @@
+#+TITLE: Verify the NeLisp IME as a loaded Fcitx 5 desktop input method
+
+* S1 Repeatable real Fcitx 5 desktop harness
+#+NOTE: 2026-10-03: criteria were regrouped after the first runs; the ledger grew from 6 drafted criteria to 10 (S2 gained the startup-queue fixture, two negative controls and the README check).
+** S1.1 With the NeLisp input method inactive, typed kanji reaches a GTK4 entry unconverted under a private fcitx5, and every owned process is reaped
+evidence: target/fcitx5-desktop-validation/suite/control/result.json sha256=e5d8f0ac5ffcdd67f6b6af60d66016a7f0ec0219d27463226cffe4322148d2ac
+** S1.2 Burst-typed kanji, Space, Enter commit 幹事 through fcitx5
+evidence: target/fcitx5-desktop-validation/suite/burst/result.json sha256=7c95892f48f91f59e0d2d7054b8b4d1e0191e2ec7a0d04af44d0d34ff59cb52a
+** S1.3 Through fcitx5 with the source-built addon, a GTK4 entry receives the 幹事 commit for kanji, Space, Enter typed by xdotool
+evidence: target/fcitx5-desktop-validation/suite/convert/result.json sha256=96e0c8a32de1d394ee479fc64a1e66cd97c4b11ac11517ca118770301ecc8db3
+
+* S2 Startup queue and recovery
+** S2.1 Native callback fixture passes, including held keys replayed in order with the unconsumed key forwarded once
+evidence: target/fcitx5-desktop-validation/fixture-ctest.log sha256=c76cf5482a6dfc2dafc576243ae4f2bf047aa7ef63be6d5c4f1d960da3a84cd5
+** S2.2 The pre-change addon fails the same fixture (keys typed during startup were not held)
+evidence: target/fcitx5-desktop-validation/fixture-head-ctest.log sha256=f340ba3926b13d156d81270c91be81e8a51acd23b147768067ef04e71b046d86
+** S2.3 Keys typed while a slowed NeLisp starts do not leak and convert to 幹事 in fcitx5
+evidence: target/fcitx5-desktop-validation/suite/early/result.json sha256=43004fcc3a17404befede8825dda70df46758d079c8e6040311b691ad18eb28b
+** S2.4 The pre-change addon leaks the same keys unconverted
+evidence: target/fcitx5-desktop-validation/ctl-head-early.log sha256=5684a884ac458b553fbbdd899b5d8b9f009450c7ba6ff04638df5dc67e5c6887
+** S2.5 After the NeLisp runtime is killed, the same fcitx5 process recovers and converts again
+evidence: target/fcitx5-desktop-validation/suite/recover/result.json sha256=348da68fadcd6db5494f73f68cb83c249078a589ba068677f9c04285f8852913
+** S2.6 README documents the startup queue and the desktop suite command and prerequisites
+cmd: grep -q 'QUEUE_FULL' platform/linux/fcitx5/README.md && grep -q 'verify-desktop-suite.py' platform/linux/fcitx5/README.md && grep -q 'FCITX5_PREFIX' platform/linux/fcitx5/README.md
+** S2.7 Full Fcitx 5 desktop suite (control, convert, burst, early, recover) passes on the real runtime
+evidence: target/fcitx5-desktop-validation/suite/summary.json sha256=da0f42730875fd1f71075010108a7695157c16ef42c3ed3cebab6515c3cf8619
