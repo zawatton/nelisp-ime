@@ -47,21 +47,21 @@ cmd: bash "$NELISP_AOT_OBJECTS_ROOT/test/aot-dll-objects/run.sh"
 
 ** S2.5 A method DLL using all three object kinds loads in tsf-host and survives the harness end to end
 #+NOTE: test-native-skk.ps1 with skk-min.dll built from object-mode Elisp, 2026-11-13
-evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=b44a4b3853c24997cf592286507fc5c89567a1f85eb5773544395bc943ddfcd2
+evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=bba120e4f2c35b257405b8065729e49c38dfd80ca56c2a089508841947e4449d
 
 * S3 Native SKK minimal method
 
 ** S3.1 Romaji to kana, katakana (q), Latin modes and ▽/▼ markers
 #+NOTE: test-native-skk.ps1 with skk-min.dll built from object-mode Elisp, 2026-11-13
-evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=b44a4b3853c24997cf592286507fc5c89567a1f85eb5773544395bc943ddfcd2
+evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=bba120e4f2c35b257405b8065729e49c38dfd80ca56c2a089508841947e4449d
 
 ** S3.2 Dictionary lookup (UTF-8/EUC-JP jisyo files and skkserv) with okurigana
 #+NOTE: okuri, UTF-8 and EUC-JP jisyo, fake skkserv (up/down) scenarios in test-native-skk.ps1, clean rebuild 2026-11-13
-evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=b44a4b3853c24997cf592286507fc5c89567a1f85eb5773544395bc943ddfcd2
+evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=bba120e4f2c35b257405b8065729e49c38dfd80ca56c2a089508841947e4449d
 
 ** S3.3 Learning and word registration persist to the user jisyo
 #+NOTE: test-native-skk.ps1 (okuri, EUC-JP, learning across reopen, registration incl. inner commit and cancel; temp user jisyo), 2026-11-13
-evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=b44a4b3853c24997cf592286507fc5c89567a1f85eb5773544395bc943ddfcd2
+evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=bba120e4f2c35b257405b8065729e49c38dfd80ca56c2a089508841947e4449d
 
 ** S3.4 With backend=native the Shift, kana-q and registration scenarios of test-mode-authority.ps1 pass
 #+NOTE: test-mode-authority.ps1 -Engine native, all 19 DDSKK scenarios, clean rebuild 2026-11-13
