@@ -1,0 +1,82 @@
+#+TITLE: Selectable input-method backends (runtime / native)
+
+* S1 Backend selection seam (runtime path unchanged)
+
+** S1.1 input-method.json accepts backend runtime|native (default runtime) and prepare-methods.py validates it
+cmd: cd platform/windows && python test_prepare_methods.py
+
+** S1.2 TSF core talks to engines only through an EngineBackend interface; PipeBackend wraps today's EngineClient
+#+REQUIRES: SKK_IME_SEAM_ROOT
+cmd: grep -q "std::unique_ptr<ddskk::EngineBackend> engine_" "$SKK_IME_SEAM_ROOT/windows/src/text_service.h" && grep -q "class EngineClient : public EngineBackend" "$SKK_IME_SEAM_ROOT/windows/src/engine_client.h"
+
+** S1.3 Runtime backend regression: test-mode-authority.ps1 -Engine quail passes on the seam build
+#+NOTE: 19/19 scenarios on build/seam with the pkg-fix stage, re-run after the native suite changes, 2026-11-13
+evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s1.3-quail-suite.txt sha256=a0e72bb507e1e929ffc153435feae7064a0496a5aaab3215478dfe2b18349cd3
+
+** S1.4 A stub native method selected through InputMethodBackend/InputMethodModule loads in the harness; a missing module fails cleanly
+#+REQUIRES: SKK_IME_SEAM_ROOT,NELISP_IME_RUNTIME
+#+TIMEOUT: 600
+cmd: cd "$SKK_IME_SEAM_ROOT" && powershell -NoProfile -ExecutionPolicy Bypass -File windows/test-host/test-native-method.ps1 -BuildDirectory "$(cygpath -w "$SKK_IME_SEAM_ROOT/build/seam/Release")" -EngineExecutablePath "$NELISP_IME_RUNTIME" -RepositoryPath "$(cygpath -w "$SKK_IME_SEAM_ROOT")" </dev/null
+
+* S2 AOT object support in NeLisp (strings, lists, hash tables)
+
+** S2.1 Compiled code can create, index and compare strings with UTF-8/UTF-16 conversion
+#+REQUIRES: NELISP_AOT_OBJECTS_ROOT
+#+TIMEOUT: 300
+cmd: bash "$NELISP_AOT_OBJECTS_ROOT/test/aot-dll-objects/run.sh"
+
+** S2.2 Compiled code can build and walk lists (cons, car, cdr, nreverse, dolist)
+#+REQUIRES: NELISP_AOT_OBJECTS_ROOT
+#+TIMEOUT: 300
+cmd: bash "$NELISP_AOT_OBJECTS_ROOT/test/aot-dll-objects/run.sh"
+
+** S2.3 Compiled code can use equal/eq hash tables (make, get, put, remove, iterate)
+#+REQUIRES: NELISP_AOT_OBJECTS_ROOT
+#+TIMEOUT: 300
+cmd: bash "$NELISP_AOT_OBJECTS_ROOT/test/aot-dll-objects/run.sh"
+
+** S2.4 Allocation is bounded in a long-lived foreign process (no growth over 100k key events)
+#+REQUIRES: NELISP_AOT_OBJECTS_ROOT
+#+TIMEOUT: 300
+cmd: bash "$NELISP_AOT_OBJECTS_ROOT/test/aot-dll-objects/run.sh"
+
+** S2.6 Plain Elisp forms (cons, car, puthash, gethash, concat, string=, integer literals) compile to the DLL object library without dlo_ calls
+#+REQUIRES: NELISP_AOT_OBJECTS_ROOT
+#+TIMEOUT: 300
+cmd: bash "$NELISP_AOT_OBJECTS_ROOT/test/aot-dll-objects/run.sh"
+
+** S2.5 A method DLL using all three object kinds loads in tsf-host and survives the harness end to end
+#+NOTE: test-native-skk.ps1 with skk-min.dll built from object-mode Elisp, 2026-11-13
+evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=890698b35672334e77c426f7cb82bb7747d15c759bd3e42146dbd23e9eff1770
+
+* S3 Native SKK minimal method
+
+** S3.1 Romaji to kana, katakana (q), Latin modes and ▽/▼ markers
+#+NOTE: test-native-skk.ps1 with skk-min.dll built from object-mode Elisp, 2026-11-13
+evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=890698b35672334e77c426f7cb82bb7747d15c759bd3e42146dbd23e9eff1770
+
+** S3.2 Dictionary lookup (UTF-8/EUC-JP jisyo files and skkserv) with okurigana
+#+NOTE: okuri, UTF-8 and EUC-JP jisyo, fake skkserv (up/down) scenarios in test-native-skk.ps1, clean rebuild 2026-11-13
+evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=890698b35672334e77c426f7cb82bb7747d15c759bd3e42146dbd23e9eff1770
+
+** S3.3 Learning and word registration persist to the user jisyo
+#+NOTE: test-native-skk.ps1 (okuri, EUC-JP, learning across reopen, registration incl. inner commit and cancel; temp user jisyo), 2026-11-13
+evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3-native-skk.txt sha256=890698b35672334e77c426f7cb82bb7747d15c759bd3e42146dbd23e9eff1770
+
+** S3.4 With backend=native the Shift, kana-q and registration scenarios of test-mode-authority.ps1 pass
+#+NOTE: test-mode-authority.ps1 -Engine native, all 19 DDSKK scenarios, clean rebuild 2026-11-13
+evidence: $SKK_IME_SEAM_ROOT/target/method-backends/s3.4-native-suite.txt sha256=88075de241b02636a14487fb569781677cbe978e480bcf253b901dd86cab4e3b
+
+* S4 Developer guide and live use
+
+** S4.1 Developer guide with a worked native method example
+#+NOTE: written by the S3 worker 2026-11-13; coordinator checked the outline only, full review pending
+evidence: docs/guide/native-input-methods.org sha256=d8d46edf131cfc2d6b2d06defa43195c5bfce95e3dccd2ab26521d2b02689ebd
+
+** S4.2 Example method builds from a clean checkout with the documented commands
+#+REQUIRES: SKK_IME_SEAM_ROOT,NELISP_AOT_OBJECTS_ROOT
+#+TIMEOUT: 600
+cmd: cd "$SKK_IME_SEAM_ROOT" && NELISP_ROOT="$NELISP_AOT_OBJECTS_ROOT" bash windows/native-methods/example-upcase/example-check.sh </dev/null
+
+** S4.3 Native SKK method published live and confirmed by the user in Emacs
+pending

@@ -1,0 +1,257 @@
+#+TITLE: Native input methods (backend "native")
+#+AUTHOR: nelisp-ime contributors
+#+DATE: 2026-11-13
+
+Paths are relative to one of three repositories:
+- [ime] nelisp-ime (this manifest repository: =packages/=, =platform/windows/=)
+- [skk] nelisp-skk-ime (TSF shim and tests: =windows/=)
+- [nelisp] nelisp (the AOT compiler and the object layer: =lisp/=, =test/=)
+
+* 1. Runtime or native backend?
+
+An input method declares one backend in its =input-method.json=.
+
+| | =runtime= (default) | =native= |
+|---+---+---|
+| Logic runs in | the engine process (NeLisp/Emacs Lisp, pipe protocol) | a DLL loaded into the TSF host process |
+| Written in | any Elisp the engine can load (DDSKK, Quail, lattice) | restricted Elisp compiled ahead of time (object mode) or C/C++ |
+| Latency | one pipe round trip per key | a function call |
+| Failure domain | the engine can crash or hang without taking the app down | a bug in the DLL is a bug in every application that loads the TIP |
+| Libraries | all of Emacs Lisp | only the forms of section 5; no buffers, no regexps, no =format= |
+| Update | engine restart | the DLL is reloaded with the TIP |
+
+Choose =runtime= when you need existing Elisp packages or buffer-based
+editing.  Choose =native= for a small, self-contained method (a romaji table,
+a table-driven layout, a minimal SKK) where startup cost and per-key latency
+matter and the logic fits the object-mode subset.  The reference native method
+is =windows/native-methods/skk-min/= [skk]; the smallest example is
+=windows/native-methods/example-upcase/= [skk].
+
+* 2. Manifest fields
+
+[ime] =packages/<id>/input-method.json= (schema 1) gains two optional fields:
+
+- ="backend"=: ="runtime"= (default) or ="native"=.
+- ="module"=: required for =native=, forbidden for =runtime=.  A relative
+  path to a =.dll= inside the package directory: no backslash, no leading
+  slash, no drive letter, must exist, must not escape the package, and must
+  also be listed in ="files"=.
+
+=platform/windows/prepare-methods.py= (=validate_backend=) enforces these
+rules and writes =backend= and =module_path= (stage-relative) into every
+catalog entry.  =platform/windows/test_prepare_methods.py= covers it
+(=python -I platform/windows/test_prepare_methods.py=).
+
+=platform/windows/input-methods.ps1= (=BackendSettings=) turns a catalog entry
+into two registry values of the settings key
+(=HKCU\Software\NativeIME= or the private key of a test run):
+=InputMethodBackend= (=runtime=|=native=) and =InputMethodModule= (absolute
+path of the DLL inside the stage; it must exist and stay inside the stage).
+Both Publish and Select write them, and Select restores the previous values if
+it fails.  [skk] =windows/src/inproc_backend.cpp= reads them in
+=CreateEngineBackend()=: =native= creates an =InprocBackend= that loads only
+absolute module paths; anything else uses the pipe backend.
+
+* 3. The method ABI
+
+Authority: [skk] =windows/src/method_abi.h= (ABI version 1).  A method DLL
+exports one C symbol:
+
+#+begin_src c
+const NativeImeMethodApi* NativeImeGetMethodApi(uint32_t version);
+#+end_src
+
+It returns a static table (=size= = sizeof the table, =version= = 1) or null.
+The table has eight entry points in this order; every one returns the number
+of bytes written to =out= (>= 0) or a negative =NATIVEIME_METHOD_ERR_*=
+(-1 failed, -2 =out= too small, -3 unsupported):
+
+- =open(void** session)=: create a session, 0 on success.
+- =close(session)=.
+- =key(session, codepoint, out, capacity)=: one Unicode scalar (the wire
+  "KEY n").
+- =control(session, name, out, capacity)=: =name= is the wire control name:
+  BACKSPACE CONVERT PREVIOUS COMMIT CANCEL QUIT SEGMENT-PREV SEGMENT-NEXT
+  SEGMENT-SHRINK SEGMENT-EXTEND TO-HIRAGANA TO-KATAKANA TO-HALF-KATAKANA
+  TO-WIDE-LATIN TO-LATIN LEFT RIGHT HOME END DELETE
+  (=windows/src/engine_protocol.cpp=, =EncodeControlRequest=).  QUIT is
+  stepwise keyboard-quit (C-g, Esc); CANCEL is =skk-kakutei= (C-j).
+- =convert(session, keys, count, out, capacity)=: atomic reset, replay =keys=
+  and convert.
+- =select(session, index, commit, out, capacity)=: jump to a candidate;
+  =commit != 0= also commits it.
+- =reset(session, out, capacity)=.
+- =rules(session, out, capacity)=: a =RULES 1 ...= line (may list no rules).
+
+Calls for one session are serialised by the core.  A call that changes
+nothing still returns the current STATE line.  Do not keep global state that
+outlives =close()= (skk-min refcounts its shared tables and frees them with the
+last session).
+
+** STATE line
+
+The result is exactly what the pipe backend receives, parsed by
+=ParseStateResponse= ([skk] =windows/src/engine_protocol.cpp=):
+
+#+begin_example
+STATE <mode> <cursor> <composition_start> <text> <pending> <candidate_index> <candidates> [<extra>]
+#+end_example
+
+- =mode=: =hiragana katakana latin wide-latin abbrev preedit candidate
+  registration=.  Anything except =latin= counts as kana input.
+- =text=, =pending=, each candidate: concatenated 6-digit lowercase hex
+  scalars, ="-"= when empty.  =pending= is the unresolved romaji prefix.
+- =candidates=: comma-separated hex strings or ="-"=; =candidate_index= is
+  the highlighted one or -1.
+- =composition_start=: -1 means =text= is committed text.  A value >= 0 means
+  the composition starts at that character index of =text=; skk-min puts any
+  committed prefix before it, then the marker (U+25BD for a reading, U+25BC for
+  a candidate) and the reading or candidate.  =cursor= is the character count
+  of =text= in skk-min.
+- Registration: =mode= is =registration=, =text= is the draft being typed
+  (plus any inner composition), the ninth field is the hex of the reading
+  being registered.  The application keeps only that reading inline; the draft
+  is shown by the host UI.  Enter registers and returns a normal state whose
+  =text= is the word, committed once; C-g returns to the reading.
+- A ninth field for other modes is the lattice segment list
+  =start:len,...;active= (code points).
+
+Lesson learned: the host treats text that arrives together with a non-empty
+=pending= as composition text and overwrites it on the next state, so a method
+must not emit committed text and pending romaji in the same STATE (skk-min
+holds a small tsu back until the next kana resolves).
+
+** rules
+
+=RULES 1 key:carry:hira:kata:command ...=, each field in the same hex
+encoding (=ParseRomajiRules=).  An empty list means "use the core's tables".
+
+* 4. Memory and the object layer
+
+[nelisp] =lisp/nelisp-aot-dll-objects.el= is a library of raw-subset
+functions (=dlo_*=) giving a DLL regions, conses, strings (UTF-8), and hash
+tables (=eq=, =eql=, =equal=) laid out in the runtime's tagged-word format
+(fixnum =(n<<2)|1=, nil 3, t 7, cons =cell|2=, string =hdr|4=, record
+=body|6=).  Constructors return 0 on out-of-memory and readers do not check.
+
+** Regions
+
+All allocation goes to one process-global /current region/ (no TLS exists in
+the PE writer; the core serialises calls).  =dlo_region_new=,
+=dlo_region_set_current= (returns the previous one), =dlo_region_reset= (frees
+every chunk but the head), =dlo_region_destroy=.  Rules used by skk-min:
+
+- one long-lived region for the rule table, dictionaries and server cache,
+  shared and freed with the last session;
+- two regions per session used alternately: a call allocates in the one that
+  does not hold the live state, copies every state string into it at the end
+  (=concat s ""=), and the previous region is reset at the start of the next
+  call.  Lists that point only into the long-lived region need no copy;
+- to allocate long-lived data from inside a call, switch to that region, build
+  it and switch back.
+
+The simplest scheme (example-upcase) keeps no objects across calls: one region
+per session, reset at the start of every call.
+
+** Object mode
+
+[nelisp] =lisp/nelisp-aot-dll-objects-expand.el= expands ordinary Elisp to the
+=dlo_*= forms at build time.  Per defun opt-in: =(odefun NAME ARGS BODY)= for
+internal functions, =(odefun-export NAME RAW-ARGS BODY)= for entry points (raw
+integer arguments are boxed on entry, the fixnum result is unboxed on exit).
+Any other form in the unit (a plain =defun=, a =data-blob=) is passed through.
+
+Supported: integers (62-bit), string literals (copied into the current region
+on every evaluation), =nil= =t=, quoted lists of ints/strings; =if when unless
+cond and or not null progn let let* setq while dolist dotimes push= (place must
+be a variable); =+ - * / mod 1+ 1-= (=/= and =mod= take two arguments);
+=< > <= >= = /= eq equal string== ; =cons car cdr list nreverse length=;
+=concat aref number-to-string substring char-to-string= (non-negative numbers
+only); =make-hash-table gethash puthash remhash hash-table-count maphash=
+(=maphash= needs a literal =(lambda (K V) ...)=); calls to other =odefun=s.
+Boundary forms: =(box RAW)= and =(unbox OBJ)= (inside =box= only),
+=string-from-utf8/utf16/cstr=, =string-to-utf16=, =string-copy-out S BUF CAP=,
+=string-data=, =string-nbytes=, =region-reset=, =region-chunks=, and
+=(word-ref P I)= / =(word-set P I V)= for 64-bit slots of a raw block (the
+session struct).  Everything else signals =nelisp-aot-obj-unsupported= at build
+time (floats, symbols, =funcall=, =catch=, =format=, regexps, buffers).
+
+Remember that every object-mode variable is a tagged word.  A zero-filled raw
+slot is /not/ a valid object (fixnum 0 is the word 1): initialise slots before
+reading them as objects, or use raw reads (=ptr-read-u64= inside =box=).
+
+* 5. skk-min conventions
+
+[skk] =windows/native-methods/skk-min/=:
+
+- =skk-min.el=: the method; =skk-min-rules.txt= (generated by =gen-rules.py=):
+  one "romaji kana" per line; =build.sh=; =probe.c= (command-line ABI driver).
+- Jisyo (read once at the first =open=): =NATIVEIME_SKK_JISYO=, else
+  =DDSKK_DICTIONARY_FILES=.  UTF-8, or EUC-JP when the first line contains
+  "euc" (converted through a generated JIS X 0208 table; JIS X 0212 becomes
+  U+FFFD).  Okuri-ari entries are keyed like =かk=; =[...]= blocks are skipped.
+- User jisyo: =NATIVEIME_SKK_USER_JISYO=, else =DDSKK_USER_JISYO=, else
+  =%LOCALAPPDATA%\NativeIME\skk-min-user.jisyo= (never the DDSKK directory).
+  Committing a candidate moves it to the front and rewrites the file (UTF-8,
+  okuri-ari first); registrations are stored the same way.  User candidates
+  precede file candidates.
+- skkserv: =NATIVEIME_SKK_SERVER=host:port= (unset = off).  One
+  connection per uncached reading ("1<reading> " -> "1/a/b/\n" or "4"), UTF-8,
+  non-blocking socket and =WSAPoll= with a 300 ms timeout so a dead server
+  cannot hang a key.  Order: user, file, server; duplicates removed.
+- Variants for negative controls (=build.sh OUT.dll VARIANT=): =no-rules
+  no-euc no-learn no-okuri no-server=.
+
+* 6. Building
+
+#+begin_src sh
+export NELISP_ROOT=<nelisp checkout containing lisp/nelisp-aot-dll-objects*.el>
+bash windows/native-methods/skk-min/build.sh "$(cygpath -m "$PWD/out/skk-min.dll")"
+#+end_src
+
+The output path is spliced into an Elisp string: it must be a Windows-readable
+path (=D:/x/out.dll=).  MSYS paths such as =/d/x/out.dll= fail; the scripts
+convert backslashes to slashes but cannot convert MSYS paths, so use
+=cygpath -m=.  A build runs under =ulimit -v 8388608= and takes seconds.  The
+DLL exports only =NativeImeGetMethodApi=; it imports kernel32 (and ws2_32 for
+skkserv).  Put the DLL next to =input-method.json= and list it in ="files"=.
+
+* 7. Testing
+
+- ABI, no harness: =windows/native-methods/example-upcase/example-check.sh=
+  [skk] builds the example, loads it with the probe and checks a STATE round
+  trip plus a negative control.  =probe.exe DLL a b SPACE C:COMMIT RESET= works
+  on any method.
+- Object layer: =test/aot-dll-objects/run.sh= [nelisp] (raw and object flavours,
+  negative controls).
+- Seam: =windows/test-host/test-native-method.ps1= [skk] (echo stub and missing
+  module through the private TSF harness).
+- skk-min: =windows/test-host/test-native-skk.ps1 ... -DllDirectory DIR=
+  (romaji, convert, okuri, EUC-JP, learning across processes, registration,
+  skkserv, negative controls).
+- Suite parity: =windows/test-host/test-mode-authority.ps1 -Engine native
+  -NativeMethodDll DLL ...= runs the DDSKK mode scenarios against the method.
+- Harness runs start =tsf-host.exe= and use a private registry key; never run
+  two stacks at once, never touch the live key, and keep user files out of the
+  tests (use temporary jisyo files).
+
+* 8. Pitfalls
+
+- Wide (UTF-16) strings in rodata must be 2-byte aligned for API calls; a
+  misaligned blob caused wrong results.  Prefer building strings at run time
+  from UTF-8 literals (=string-from-utf8=).
+- Do not nest =extern-call= in an argument position of another call: bind the
+  inner result with =let= first.
+- Keep =extern-call= to four register arguments.  A sixth (stack) argument
+  failed inside a DLL (=CreateFileMappingW= with a name); skk-min therefore
+  uses =_lopen/_lread= and =WSAPoll= instead of 7-argument APIs.  Exported
+  entry points with up to six arguments are fine.
+- No =%= in the raw subset: use =logand= with power-of-two sizes.
+- Windows API results typed int/DWORD leave the upper 32 bits undefined:
+  mask with =(logand r 4294967295)= before comparing; the same applies to
+  uint32 parameters of your entry points (mask them first).
+- =INVALID_SOCKET= is all ones (-1 in 64 bits).
+- Always check =GetProcAddress=/handle results and use distinct failure codes.
+- Keep committed text and pending romaji out of one STATE (section 3).
+- The Bash tool collapses double backslashes; write Windows paths with the
+  editor, not inline in shell commands.

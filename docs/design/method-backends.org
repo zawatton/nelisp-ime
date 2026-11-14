@@ -1,0 +1,92 @@
+#+TITLE: Selectable input-method backends (runtime / native)
+#+STATUS: DRAFT 2026-11-13
+
+* Goal
+An input-method developer using nelisp-ime (nelisp-skk, nelisp-quail, ...)
+chooses per method how it runs:
+
+- runtime :: full Elisp on the NeLisp runtime (nelisp.exe) behind the engine
+  host and the named-pipe STATE protocol.  Everything DDSKK offers works.
+  This is today's path and stays the default.
+- native :: the method is written in Elisp, compiled ahead of time into a
+  method DLL, and loaded in-process by the TSF core.  No runtime process,
+  no warm-up, no pipe.
+
+The user-facing choice of method stays in the existing settings; the backend
+is a property of the method, declared by its developer.
+
+* Decisions (2026-11-13, user)
+- Native methods are written in Elisp compiled to native code, not as
+  declarative data interpreted by a built-in engine.
+- The AOT subset must gain strings, lists (cons) and hash tables first: a
+  subset limited to integers and raw pointers is not acceptable for method
+  authors.  This is runtime/compiler work in NeLisp, done before the
+  native SKK method.
+- First milestone: the seam plus a minimal SKK method on the native backend
+  (kana/katakana, ▽/▼, okurigana, dictionary, learning, word registration)
+  passing the existing regression scenarios, with a developer guide.
+
+* Current state (investigation 2026-11-13)
+- Method manifest: packages/*/input-method.json, schema 1 (id, label,
+  description, adapter, engine, load, files, warmup); staged by
+  platform/windows/prepare-methods.py, published by input-methods.ps1.
+- The TSF core talks to engines only through the concrete
+  ddskk::EngineClient (windows/src/engine_client.h); BackgroundBackend is a
+  virtual interface but only for the background-poll profile.  EngineState
+  (engine_protocol.h) is the common result shape.
+- RealtimeFrontend (romaji preview) and LocalConversion (shared index
+  fallback) are in-process helpers, not alternative backends.
+- Dictionary access lives in the host (skkserv, DictionaryFiles, user jisyo).
+- The native DLL toolchain (skk-ime-native-v2, windows/native/*.el) compiles
+  an integer/pointer-only Elisp subset: no string, cons or hash objects.
+
+* Design
+** Manifest
+Add ~"backend": "runtime" | "native"~ (default runtime).  A native method
+adds ~"module": "<file>.dll"~.  prepare-methods.py validates both;
+Publish records InputMethodBackend next to InputMethod.
+
+** Core seam
+Extract an ~EngineBackend~ interface from EngineClient (SendKey, SendKeys,
+ConvertKeys, SendControl, SelectCandidate, Reset, RomajiRules, learning and
+registration calls), returning EngineState.  ~PipeBackend~ is today's
+EngineClient; ~InprocBackend~ wraps a method DLL.  TextService only sees the
+interface.  The runtime path must stay byte-for-byte equivalent (all
+existing suites green).
+
+** Method ABI (native)
+A method DLL exports ~NativeImeGetMethodApi(version)~ returning
+{size, version, open, close, key, control, convert, select, reset, rules}.
+Results use the existing TLV state encoding, so the same parser serves both
+backends.  Dictionary and user-jisyo services are passed in as a callback
+table from the core (one implementation for both backends, moved out of the
+host where needed).
+
+** AOT object support (NeLisp)
+Strings (UTF-8/UTF-16 conversions), cons/lists, vectors and hash tables
+(equal/eq) usable in compiled code, with an allocator suited to a DLL in a
+foreign process.
+
+Findings (NeLisp checkout nelisp-tsf-main-20261112): the AOT compiler
+(lisp/nelisp-aot-compiler.el) already lowers record-make, cons-make and
+hash tables (FNV-based desugaring) to runtime helpers (nl_alloc_record,
+nl_val_tag, ...) written in the same subset; the tagged layout is in
+lisp/nelisp-heap-accessors.el (tag = low 3 bits, record = header, type,
+slots).  The full allocator/GC (src/nelisp-allocator.el,
+src/nelisp-gc-inner.el) uses global regions and AOT root vectors, which are
+unsafe on a foreign host thread.
+
+Proposed approach (pending user approval):
+1. Link the existing helpers into DLL images with the same tagged layout,
+   backed by DLL-safe regions instead of the runtime allocator: a
+   per-session region reset at composition/session boundaries for
+   transient objects, and a long-lived region for method data (rule tables,
+   dictionary index).  No collector; calls are serialised per session.
+2. Later, if needed, swap in the real allocator/GC once its init, root
+   and threading constraints are solved; the layout makes objects
+   interchangeable.  Exact scope follows from what method code
+needs: the native SKK method is the acceptance test.
+
+* Out of scope (this milestone)
+Native Quail-style methods; full DDSKK feature parity on the native backend
+(abbrev, numeric conversion, annotations stay runtime-only).
