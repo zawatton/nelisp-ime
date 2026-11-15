@@ -28,7 +28,8 @@ evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-st6.txt sha256=9ee29f89bbf5dd331
 pending
 
 ** S2.5 TAB completion of a ▽ reading (and . / , to move between completions)
-pending
+#+NOTE: f5-* and f8-* scenarios PASS on core 798e1e6 (seam-keys) + engine eafc126 (st8), suite green, 2026-11-15
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-st8.txt sha256=f818dd5bf2d272258ad77ac3269da602871570b880122467009516cb445495a2
 
 ** S2.6 Q starts ▽ without a character
 #+NOTE: test-ddskk-features.ps1 scenarios PASS on stage st6 (a40106b) with full mode-authority suite green, 2026-11-15
@@ -38,7 +39,8 @@ evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-st6.txt sha256=9ee29f89bbf5dd331
 pending
 
 ** S2.8 Candidate list after several SPACE presses, selection with asdfjkl, x goes back
-pending
+#+NOTE: f5-* and f8-* scenarios PASS on core 798e1e6 (seam-keys) + engine eafc126 (st8), suite green, 2026-11-15
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-st8.txt sha256=f818dd5bf2d272258ad77ac3269da602871570b880122467009516cb445495a2
 
 ** S2.9 Lisp candidates such as (concat ...) are evaluated
 #+NOTE: test-ddskk-features.ps1 scenarios PASS on stage st6 (a40106b) with full mode-authority suite green, 2026-11-15
