@@ -1,0 +1,69 @@
+#+TITLE: Full DDSKK features in the runtime input method
+
+* S1 Feature scenario suite (live-equivalent harness, runtime DDSKK method)
+
+** S1.1 A scenario suite drives every feature below through tsf-host with the live method package and reports PASS/FAIL per feature
+pending
+
+** S1.2 Gap report: every feature classified PASS or FAIL with the observed buffer, before any fix
+pending
+
+* S2 DDSKK input features work in the runtime method
+
+** S2.1 @ inserts today's date (skk-today)
+pending
+
+** S2.2 Numeric conversion: Q 1 2 3 e n SPACE gives #-entry candidates, ENTER commits
+pending
+
+** S2.3 Abbrev mode: / starts an ASCII reading, SPACE converts it
+pending
+
+** S2.4 Prefix/suffix conversion with >
+pending
+
+** S2.5 TAB completion of a ▽ reading (and . / , to move between completions)
+pending
+
+** S2.6 Q starts ▽ without a character
+pending
+
+** S2.7 X purges the current candidate from the personal jisyo
+pending
+
+** S2.8 Candidate list after several SPACE presses, selection with asdfjkl, x goes back
+pending
+
+** S2.9 Lisp candidates such as (concat ...) are evaluated
+pending
+
+** S2.10 Annotations after ; are not inserted with the candidate
+pending
+
+** S2.11 C-q: JIS X0201 half-width katakana
+pending
+
+** S2.12 \ code / menu input (skk-input-by-code-or-menu)
+pending
+
+** S2.13 Okurigana with sokuon and okuri-ari blocks (KaTta -> 勝った)
+pending
+
+** S2.14 Shift+symbols without DDSKK rules stay literal (regression guard for 42a8ebb)
+pending
+
+* S3 User DDSKK settings honoured
+
+** S3.1 skk-egg-like-newline t: ENTER in ▼ commits without a newline
+pending
+
+** S3.2 skk-delete-implies-kakutei nil: BS in ▼ shows the previous candidate
+pending
+
+** S3.3 skk-auto-insert-paren t: 「 inserts 「」 with the caret inside
+pending
+
+* S4 Live
+
+** S4.1 Runtime method with all fixes published live and confirmed by the user in Windows Terminal and Emacs
+pending
