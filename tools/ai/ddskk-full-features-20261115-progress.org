@@ -6,7 +6,8 @@
 pending
 
 ** S1.2 Gap report: every feature classified PASS or FAIL with the observed buffer, before any fix
-pending
+#+NOTE: 21 scenarios (test-ddskk-features.ps1, 3cf7781) on pkg-at5: 6 PASS, 1 unprovable, 14 FAIL; judged from AFTER END lines, 2026-11-15
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s1-gap-report.txt sha256=39300508670eee719b168f8fecb3624a0b3bedd8410e6eaeaf93d3df6de1ba26
 
 * S2 DDSKK input features work in the runtime method
 
