@@ -87,4 +87,5 @@ evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-st6.txt sha256=9ee29f89bbf5dd331
 * S4 Live
 
 ** S4.1 Runtime method with all fixes published live and confirmed by the user in Windows Terminal and Emacs
-pending
+#+NOTE: Published the verified core, host with unchanged native-policy executable and rebound manifest, and st11-code-ui package; all 296 installed files and six customized engine hashes match. Live method readiness and kana candidates pass. The user confirmed mode re-display and registration cancellation in Windows Terminal and Emacs after deployment (2026-11-15). Original 20 criteria retained. Full deployment logs, registry backups and distinct rollback formats are recorded in the evidence.
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s4-live-20261115.txt sha256=58012b0cdc02a10b2be6b1ad6f2da3a7ef6eb7e5e339f1d60aabb20acb0c143e

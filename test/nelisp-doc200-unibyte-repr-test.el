@@ -94,13 +94,33 @@
   (nelisp-doc200-unibyte-repr-test--defun
    name nelisp-standalone--applyfn-bf-helpers))
 
+(defun nelisp-doc200-unibyte-repr-test--standalone-binary ()
+  "Return the standalone executable, or skip when none is built.
+An explicit non-empty NELISP_BIN must name an executable file; an invalid
+override fails rather than silently falling back.  Otherwise use the
+host's target/nelisp.exe (Windows) or target/nelisp."
+  (let ((override (getenv "NELISP_BIN")))
+    (if (and override (not (string-empty-p override)))
+        (progn
+          (unless (and (file-executable-p override)
+                       (not (file-directory-p override)))
+            (ert-fail (format "NELISP_BIN is not an executable file: %S"
+                              override)))
+          override)
+      (let* ((name (if (memq system-type '(windows-nt cygwin ms-dos))
+                       "target/nelisp.exe"
+                     "target/nelisp"))
+             (binary (expand-file-name
+                      name nelisp-doc200-unibyte-repr-test--repo-root)))
+        (unless (and (file-executable-p binary)
+                     (not (file-directory-p binary)))
+          (ert-skip (format "%s is not built; standalone-reader-test owns it"
+                            name)))
+        binary))))
+
 (defun nelisp-doc200-unibyte-repr-test--eval-standalone (expression)
   "Evaluate EXPRESSION with the prepared standalone binary and return stdout."
-  (let ((binary (expand-file-name
-                 "target/nelisp"
-                 nelisp-doc200-unibyte-repr-test--repo-root)))
-    (unless (file-executable-p binary)
-      (ert-skip "target/nelisp is not built; standalone-reader-test owns it"))
+  (let ((binary (nelisp-doc200-unibyte-repr-test--standalone-binary)))
     (with-temp-buffer
       (let ((rc (call-process binary nil t nil "--eval" expression)))
         (unless (= rc 0)
@@ -111,12 +131,8 @@
 
 (defun nelisp-doc200-unibyte-repr-test--eval-standalone-error (expression)
   "Evaluate EXPRESSION and return (EXIT-CODE STDERR) for a failing read."
-  (let ((binary (expand-file-name
-                 "target/nelisp"
-                 nelisp-doc200-unibyte-repr-test--repo-root))
-        (stderr-file (make-temp-file "nelisp-doc200-reader-stderr-")))
-    (unless (file-executable-p binary)
-      (ert-skip "target/nelisp is not built; standalone-reader-test owns it"))
+  (let* ((binary (nelisp-doc200-unibyte-repr-test--standalone-binary))
+         (stderr-file (make-temp-file "nelisp-doc200-reader-stderr-")))
     (unwind-protect
         (with-temp-buffer
           (let ((rc (call-process binary nil (list t stderr-file) nil

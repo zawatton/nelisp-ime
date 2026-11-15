@@ -132,11 +132,11 @@ ert-full|tools/ai/nelisp-ai.sh|s/'nelisp-worker-soak-test\\\.el\$'/'.'/|test_fil
 # tag-14 fast path but stayed green because the generic rc path still copied
 # the same four words; it was replaced by the lethal tag-15 refcount row.
 ert-full|lisp/nelisp-aot-compiler.el|/(defun nelisp-aot-compiler--aot-direct-tag-predicate-form/,/(defconst nelisp-aot-compiler--aot-builtinn-delegation-symbols/s/(= (sexp-tag ,arg) ,nelisp-sexp-layout-tag-unibyte-str)/(= (sexp-tag ,arg) 140)/|the direct AOT stringp expansion stops accepting tag 14
-ert-full|scripts/nelisp-standalone-build.el|/(defun bf_arrayp_raw/,/(defun bf_wrong_type_hash_table/s/(= tg 14)/(= tg 140)/|arrayp stops accepting a hand-built tag-14 string
-ert-full|lisp/nelisp-cc-jit-type-of.el|/(defun nl_jit_type_of_tag/,/(defun nl_jit_type_of_inner/s/((= tag 14)/((= tag 140)/|type-of stops mapping tag 14 to string
-ert-full|scripts/nelisp-standalone-build.el|/(defun nl_gc_mark_slot/,/(defun nl_gc_poison_fill/s/(or (= tag 5) (= tag 14))/(or (= tag 5) (= tag 140))/|the precise GC marker stops marking a reachable tag-14 byte buffer
-ert-full|lisp/nelisp-cc-sexp-clone-into.el|/(defun nl_sci_bump/,/(defun nl_sci_rc/s/(or (= tag 6) (= tag 15))/(or (= tag 6) (= tag 150))/|the cloner stops refcounting the NlStr box of a hand-built tag-15 string
-ert-full|scripts/nelisp-standalone-build.el|/(defun nl_cli_value_to_buf/,/(defun nl_cli_write_value/s/((= tag 14)/((= tag 140)/|CLI value output stops rendering tag-14 bytes with raw octal escapes
+ert-full|scripts/nelisp-standalone-build.el|/(defun bf_arrayp_raw/,/(defun bf_wrong_type_hash_table/s/(= tg 14)/(= tg 140)/|arrayp stops accepting a hand-built tag-14 string|linux-x86_64
+ert-full|lisp/nelisp-cc-jit-type-of.el|/(defun nl_jit_type_of_tag/,/(defun nl_jit_type_of_inner/s/((= tag 14)/((= tag 140)/|type-of stops mapping tag 14 to string|linux-x86_64
+ert-full|scripts/nelisp-standalone-build.el|/(defun nl_gc_mark_slot/,/(defun nl_gc_poison_fill/s/(or (= tag 5) (= tag 14))/(or (= tag 5) (= tag 140))/|the precise GC marker stops marking a reachable tag-14 byte buffer|linux-x86_64
+ert-full|lisp/nelisp-cc-sexp-clone-into.el|/(defun nl_sci_bump/,/(defun nl_sci_rc/s/(or (= tag 6) (= tag 15))/(or (= tag 6) (= tag 150))/|the cloner stops refcounting the NlStr box of a hand-built tag-15 string|linux-x86_64
+ert-full|scripts/nelisp-standalone-build.el|/(defun nl_cli_value_to_buf/,/(defun nl_cli_write_value/s/((= tag 14)/((= tag 140)/|CLI value output stops rendering tag-14 bytes with raw octal escapes|linux-x86_64
 # Doc 200 P4 key-equality proof.  The range replacement restores the exact
 # outer tag-identity gate that rejected a tag-5/tag-14 ASCII pair before the
 # shared character-count/byte-count/bytes comparison could run.  The mutation
