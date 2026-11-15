@@ -11,10 +11,12 @@ pending
 * S2 DDSKK input features work in the runtime method
 
 ** S2.1 @ inserts today's date (skk-today)
-pending
+#+NOTE: at-sign-today / numeric-conversion scenarios in test-mode-authority.ps1, full quail suite 27/27, 2026-11-15
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-at-numeric.txt sha256=ee28b75ab446c2e4bcd5ec4b781974a93ffe80d2fd4bec37360d23ec382d66c6
 
 ** S2.2 Numeric conversion: Q 1 2 3 e n SPACE gives #-entry candidates, ENTER commits
-pending
+#+NOTE: at-sign-today / numeric-conversion scenarios in test-mode-authority.ps1, full quail suite 27/27, 2026-11-15
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-at-numeric.txt sha256=ee28b75ab446c2e4bcd5ec4b781974a93ffe80d2fd4bec37360d23ec382d66c6
 
 ** S2.3 Abbrev mode: / starts an ASCII reading, SPACE converts it
 pending
@@ -50,7 +52,8 @@ pending
 pending
 
 ** S2.14 Shift+symbols without DDSKK rules stay literal (regression guard for 42a8ebb)
-pending
+#+NOTE: at-sign-today / numeric-conversion scenarios in test-mode-authority.ps1, full quail suite 27/27, 2026-11-15
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-at-numeric.txt sha256=ee28b75ab446c2e4bcd5ec4b781974a93ffe80d2fd4bec37360d23ec382d66c6
 
 * S3 User DDSKK settings honoured
 
