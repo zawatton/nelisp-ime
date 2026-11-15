@@ -3,8 +3,8 @@
 * S1 Feature scenario suite (live-equivalent harness, runtime DDSKK method)
 
 ** S1.1 A scenario suite drives every feature below through tsf-host with the live method package and reports PASS/FAIL per feature
-#+NOTE: test-ddskk-features.ps1 scenarios PASS on stage st6 (a40106b) with full mode-authority suite green, 2026-11-15
-evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-st6.txt sha256=9ee29f89bbf5dd3316d0f1ccfb02819ab0a4bd70714c25bb75cec9c97ca81e7f
+#+NOTE: Final ordered build and st11-code-ui pass all 33 selected feature scenarios and the separate 27-case mode suite (2026-11-15). The delayed B100 fixture also passes its three focused scenarios. A subsequent selector-only change separates the two delayed scenarios from ordinary defaults; all assertions are unchanged, and ten selector checks plus a rejected mutation validate the profile boundary.
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-final-ordered.txt sha256=3f737882ed28903d7d8492082cc2677b2856430d24afbe0ec341717eabf8e605
 
 ** S1.2 Gap report: every feature classified PASS or FAIL with the observed buffer, before any fix
 #+NOTE: 21 scenarios (test-ddskk-features.ps1, 3cf7781) on pkg-at5: 6 PASS, 1 unprovable, 14 FAIL; judged from AFTER END lines, 2026-11-15
@@ -25,7 +25,8 @@ evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-at-numeric.txt sha256=ee28b75ab4
 evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-st6.txt sha256=9ee29f89bbf5dd3316d0f1ccfb02819ab0a4bd70714c25bb75cec9c97ca81e7f
 
 ** S2.4 Prefix/suffix conversion with >
-pending
+#+NOTE: Four normal scenarios and the added 100ms pending-provider suffix case pass on the final ordered build. Space now joins the current pending printable request; idle controls remain unclaimed and queued Latin-switch replay preserves the literal Space. The old delayed core fails the same candidate precondition. Criterion was strengthened to require normal and delayed paths, without changing the 20-criterion denominator (2026-11-15).
+cmd: [ "$(grep -c '^PASS quail/f4-' "$DDSKK_FULL_ROOT/target/ddskk-full/s2-f4-latest.txt")" -eq 4 ] && grep -qx 'RESULT PASS' "$DDSKK_FULL_ROOT/target/ddskk-full/s2-f4-latest.txt" && [ "$(grep -c '^PASS quail/f4-suffix-after-candidate ' "$DDSKK_FULL_ROOT/target/ddskk-full/s2-f4-slow100-latest.txt")" -eq 1 ] && grep -qx 'RESULT PASS' "$DDSKK_FULL_ROOT/target/ddskk-full/s2-f4-slow100-latest.txt"
 
 ** S2.5 TAB completion of a ▽ reading (and . / , to move between completions)
 #+NOTE: f5-* and f8-* scenarios PASS on core 798e1e6 (seam-keys) + engine eafc126 (st8), suite green, 2026-11-15
@@ -36,7 +37,8 @@ evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-st8.txt sha256=f818dd5bf2d272258
 evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-st6.txt sha256=9ee29f89bbf5dd3316d0f1ccfb02819ab0a4bd70714c25bb75cec9c97ca81e7f
 
 ** S2.7 X purges the current candidate from the personal jisyo
-pending
+#+NOTE: Both seeded purge scenarios pass in the final ordered suite (2026-11-15). Strict pre-purge candidate assertions fail on the old harness negative control. The final 27-case mode suite also passes.
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-final-ordered.txt sha256=3f737882ed28903d7d8492082cc2677b2856430d24afbe0ec341717eabf8e605
 
 ** S2.8 Candidate list after several SPACE presses, selection with asdfjkl, x goes back
 #+NOTE: f5-* and f8-* scenarios PASS on core 798e1e6 (seam-keys) + engine eafc126 (st8), suite green, 2026-11-15
@@ -51,10 +53,12 @@ evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-st6.txt sha256=9ee29f89bbf5dd331
 evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-st6.txt sha256=9ee29f89bbf5dd3316d0f1ccfb02819ab0a4bd70714c25bb75cec9c97ca81e7f
 
 ** S2.11 C-q: JIS X0201 half-width katakana
-pending
+#+NOTE: Reading conversion and mode toggle pass in the final ordered suite with the existing 1500ms conversion budget for KEY17 (2026-11-15). The prior core timed out at 350ms for a 375ms reply; ordinary typing remains 350ms. The final 27-case mode suite also passes.
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-final-ordered.txt sha256=3f737882ed28903d7d8492082cc2677b2856430d24afbe0ec341717eabf8e605
 
 ** S2.12 \ code / menu input (skk-input-by-code-or-menu)
-pending
+#+NOTE: All five code-input scenarios pass on st11-code-ui and the final ordered build (2026-11-15): Unicode/JIS/kuten/plane-2 formats, paged character menu, invalid-input retry, and direct-keydown cancellation. The old stage fails the basic scenario. Native exit is 0, code-purpose states never learn dictionary entries, and the full feature and mode regressions pass. Live confirmation remains pending.
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-final-ordered.txt sha256=3f737882ed28903d7d8492082cc2677b2856430d24afbe0ec341717eabf8e605
 
 ** S2.13 Okurigana with sokuon and okuri-ari blocks (KaTta -> 勝った)
 #+NOTE: test-ddskk-features.ps1 scenarios PASS on stage st6 (a40106b) with full mode-authority suite green, 2026-11-15
@@ -67,7 +71,10 @@ evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s2-at-numeric.txt sha256=ee28b75ab4
 * S3 User DDSKK settings honoured
 
 ** S3.1 skk-egg-like-newline t: ENTER in ▼ commits without a newline
-pending
+#+NOTE: Isolated t setting: normal/direct Enter is claimed with exact candidate text; idle Enter is unclaimed (negative control). All three U1 scenarios PASS, 2026-11-15. nil-setting behavior is not claimed.
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s3-u1-egg-like-newline.log sha256=99a34b64230d3224000260618c96b6d3cfa28009f3afe747348e86a6c29b8305
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s3-u1-egg-like-newline-direct.log sha256=ae3163894b8e7b3580d9787c7c7c0e72f9049bdba0d3630f948529e57af0dd68
+evidence: $DDSKK_FULL_ROOT/target/ddskk-full/s3-u1-idle-enter-control.log sha256=fb23c4868655cb00eb8f22bc330c728e74d1da58c6adc4203d5adc92cebc55ba
 
 ** S3.2 skk-delete-implies-kakutei nil: BS in ▼ shows the previous candidate
 #+NOTE: test-ddskk-features.ps1 scenarios PASS on stage st6 (a40106b) with full mode-authority suite green, 2026-11-15
